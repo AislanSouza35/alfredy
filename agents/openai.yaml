@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lancando Notas SIGEduc"
+  short_description: "Preenche e confere notas no SIGEduc a partir de planilhas."

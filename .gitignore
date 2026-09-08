@@ -1,0 +1,51 @@
+﻿# ============================================================
+# SEGREDOS — nunca versionar
+# ============================================================
+# .env carrega a GEMINI_API_KEY e a senha de app do e-mail.
+.env
+*.env
+
+# Credenciais e tokens do Google. Os tokens dão acesso contínuo às
+# contas do usuário: valem tanto quanto a senha.
+memory/classroom_credenciais.json
+memory/classroom_token*.json
+*.pem
+*.key
+
+# ============================================================
+# DADOS PESSOAIS gerados em uso
+# ============================================================
+memory/memory.json
+memory/preferencias.json
+memory/contatos.json
+memory/agenda.json
+
+# ============================================================
+# GERADOS — reconstruíveis
+# ============================================================
+venv/
+dist/
+build/
+build_temp/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+logs/
+*.bak
+*.tmp
+atalhos_antigos/
+
+# Sobra de um comando errado, não faz parte do projeto.
+X ui.main_window
+
+# ============================================================
+# MATERIAL DE AULA — nao redistribuir
+# ============================================================
+# PDFs e codigos de terceiros. Ficam no disco, fora do repositorio
+# publico, para nao redistribuir material de autoria alheia.
+*.pdf
+CÓDIGOS USADOS*/
+CÓDIGOS UTILIZADOS/
+códigos usados*/
+códigos usados.txt
