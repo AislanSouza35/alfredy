@@ -19,7 +19,7 @@ import unicodedata
 from datetime import datetime, timedelta
 
 from actions import agenda_actions
-from actions.classroom_contas import servicos
+from actions.classroom_contas import falta_para_recurso, servicos
 
 
 # Lembretes que acompanham todo evento criado. Sem isto o evento existe
@@ -65,6 +65,12 @@ def _servico_calendario(conta=""):
             )
     else:
         escolhida = (contas[0][0], contas[0][2])
+
+    # A conta pode estar boa para o Classroom e ainda não ter a
+    # permissão da agenda: cada recurso é verificado por si.
+    pendente = falta_para_recurso(escolhida[0], "agenda")
+    if pendente:
+        return None, None, pendente
 
     try:
         from googleapiclient.discovery import build

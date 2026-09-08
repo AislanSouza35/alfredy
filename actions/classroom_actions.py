@@ -76,6 +76,27 @@ def _contem(procurado, candidato):
     )
 
 
+# O Google Classroom só permite que um projeto externo lance nota em
+# atividades criadas por ele mesmo. Atividade feita pelo professor na
+# interface do Classroom é somente leitura para a API -- a tentativa
+# volta como "@ProjectPermissionDenied".
+#
+# Não é permissão faltando nem escopo errado: é regra da plataforma, e
+# não existe configuração que a contorne.
+MENSAGEM_ATIVIDADE_DE_FORA = (
+    "Não posso lançar nota nesta atividade. O Google Classroom só "
+    "permite que eu lance nota em atividades criadas por mim; as que "
+    "você criou pela interface do Classroom são somente leitura para "
+    "mim, por regra da plataforma. Não é permissão faltando e não há "
+    "configuração que resolva. "
+    "Explique isso ao usuário e ofereça duas saídas: ele lança essa "
+    "nota à mão no Classroom, ou passa a criar as atividades por mim "
+    "com criar_atividade, e aí eu consigo corrigir. "
+    "Continuo lendo tudo normalmente: entregas, quem falta e o "
+    "conteúdo enviado."
+)
+
+
 def _sem_contas():
     return (
         "Nenhuma conta do Google está autorizada ainda. "
@@ -90,6 +111,13 @@ def _executar(requisicao):
         return requisicao.execute(), None
     except Exception as erro:
         texto = str(erro)
+
+        # Vem ANTES da checagem genérica de 403: este caso também chega
+        # como 403, e cair na mensagem genérica mandaria o usuário
+        # conferir permissões que estão corretas.
+        if "ProjectPermissionDenied" in texto:
+            return None, MENSAGEM_ATIVIDADE_DE_FORA
+
         if "403" in texto:
             return None, (
                 "O Google recusou o acesso. Confira se a API do Classroom "
@@ -633,7 +661,26 @@ def _montar_prazo(prazo):
             "day": em_utc.day,
         },
         "dueTime": {"hours": em_utc.hour, "minutes": em_utc.minute},
+        # Guardado só para a confirmação falada, e removido antes de ir
+        # para a API. Sem isto o ALF repetia a data em UTC: o professor
+        # pedia 25/12 às 23:59 e ouvia "prazo 26/12", como se ele
+        # tivesse errado a data.
+        "_local": local,
     }, None
+
+
+# Como o aluno recebe o arquivo anexado.
+MODOS_DE_ARQUIVO = {
+    "ver": "VIEW",
+    "visualizar": "VIEW",
+    "leitura": "VIEW",
+    "copia": "STUDENT_COPY",
+    "cópia": "STUDENT_COPY",
+    "preencher": "STUDENT_COPY",
+    "responder": "STUDENT_COPY",
+    "editar": "EDIT",
+    "colaborar": "EDIT",
+}
 
 
 def criar_atividade(
@@ -643,6 +690,8 @@ def criar_atividade(
     pontos=None,
     prazo="",
     link="",
+    arquivo="",
+    modo_arquivo="ver",
 ):
     """
     Cria uma atividade na turma, sempre como rascunho.
@@ -661,7 +710,7 @@ def criar_atividade(
     if erro:
         return erro
 
-    email, servico, _, dados_turma, aviso = contexto
+    email, servico, credenciais, dados_turma, aviso = contexto
 
     corpo = {
         "title": titulo,
@@ -682,11 +731,64 @@ def criar_atividade(
     prazo_corpo, erro = _montar_prazo(prazo)
     if erro:
         return erro
+
+    # O campo auxiliar existe só para a confirmação falada; a API
+    # recusaria um campo desconhecido no corpo.
+    prazo_local = prazo_corpo.pop("_local", None)
     corpo.update(prazo_corpo)
+
+    materiais = []
 
     link = str(link or "").strip()
     if link:
-        corpo["materials"] = [{"link": {"url": link}}]
+        materiais.append({"link": {"url": link}})
+
+    arquivo = str(arquivo or "").strip()
+    nome_anexo = ""
+
+    if arquivo:
+        from actions.drive_actions import (
+            enviar_arquivo_para_drive,
+            liberar_para_a_turma,
+        )
+        from actions.email_actions import validar_anexo
+
+        # Mesma checagem do anexo de e-mail: nada de arquivo de senha,
+        # nada de executável, e limite de tamanho.
+        caminho, erro_arquivo = validar_anexo(arquivo)
+        if erro_arquivo:
+            return erro_arquivo
+
+        # As credenciais são as da conta dona da turma. Enviar pela
+        # primeira conta autorizada colocaria o arquivo no Drive errado,
+        # e o anexo não abriria para os alunos daquela turma.
+        id_arquivo, nome_anexo, erro_envio = enviar_arquivo_para_drive(
+            caminho, credenciais=credenciais
+        )
+        if erro_envio:
+            return erro_envio
+
+        # O arquivo nasce privado: sem liberar, o aluno vê "você precisa
+        # de permissão" ao abrir o anexo.
+        erro_permissao = liberar_para_a_turma(id_arquivo, credenciais)
+        if erro_permissao:
+            return erro_permissao
+
+        modo = MODOS_DE_ARQUIVO.get(
+            _normalizar(modo_arquivo), "VIEW"
+        )
+
+        materiais.append(
+            {
+                "driveFile": {
+                    "driveFile": {"id": id_arquivo},
+                    "shareMode": modo,
+                }
+            }
+        )
+
+    if materiais:
+        corpo["materials"] = materiais
 
     resposta, erro = _executar(
         servico.courses().courseWork().create(
@@ -700,11 +802,21 @@ def criar_atividade(
 
     if corpo.get("maxPoints"):
         detalhes.append(f"valendo {corpo['maxPoints']:g} pontos")
-    if prazo_corpo:
-        data = prazo_corpo["dueDate"]
-        detalhes.append(f"com prazo {data['day']:02d}/{data['month']:02d}")
+    if prazo_local is not None:
+        detalhes.append(
+            "com prazo " + prazo_local.strftime("%d/%m às %H:%M")
+        )
     if link:
         detalhes.append("com o link anexado")
+    if nome_anexo:
+        rotulo = {
+            "STUDENT_COPY": "com uma cópia individual para cada aluno",
+            "EDIT": "com o arquivo aberto para os alunos editarem",
+        }.get(
+            MODOS_DE_ARQUIVO.get(_normalizar(modo_arquivo), "VIEW"),
+            "com o arquivo anexado para leitura",
+        )
+        detalhes.append(f"{rotulo} ({nome_anexo})")
 
     return (
         ", ".join(detalhes)
@@ -743,6 +855,9 @@ def devolver_atividade(turma, atividade, aluno):
     )
     if erro:
         return erro
+
+    if not entrega.get("associatedWithDeveloper", False):
+        return MENSAGEM_ATIVIDADE_DE_FORA
 
     if entrega.get("assignedGrade") is None:
         return (
@@ -831,6 +946,12 @@ def preparar_nota(turma, atividade, aluno, nota):
     )
     if erro:
         return erro
+
+    # A API marca quais entregas pertencem a este projeto. Verificar
+    # aqui evita preparar uma nota, ler tudo em voz alta, o usuário
+    # confirmar, e só então descobrir que não dava.
+    if not entrega.get("associatedWithDeveloper", False):
+        return MENSAGEM_ATIVIDADE_DE_FORA
 
     nota_atual = entrega.get("assignedGrade")
 

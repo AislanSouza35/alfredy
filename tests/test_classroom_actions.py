@@ -89,8 +89,10 @@ def servico(monkeypatch):
         atividades=[{"id": "a1", "title": "Prova 1", "maxPoints": 10}],
         alunos=[_aluno("u1", "Ana Souza"), _aluno("u2", "Bruno Lima")],
         entregas=[
-            {"id": "e1", "userId": "u1", "state": "TURNED_IN"},
-            {"id": "e2", "userId": "u2", "state": "CREATED"},
+            {"id": "e1", "userId": "u1", "state": "TURNED_IN",
+             "associatedWithDeveloper": True},
+            {"id": "e2", "userId": "u2", "state": "CREATED",
+             "associatedWithDeveloper": True},
         ],
     )
     # Agora o módulo trabalha com várias contas: servicos() devolve
@@ -212,7 +214,8 @@ def test_aceita_virgula_como_separador(servico):
 
 def test_avisa_quando_vai_substituir_nota_existente(servico):
     servico._entregas = [
-        {"id": "e1", "userId": "u1", "state": "RETURNED", "assignedGrade": 6}
+        {"id": "e1", "userId": "u1", "state": "RETURNED", "assignedGrade": 6,
+         "associatedWithDeveloper": True}
     ]
 
     retorno = sala.preparar_nota("3A", "Prova 1", "Ana", "8")
@@ -278,7 +281,8 @@ def test_listar_atividades_mostra_pontuacao(servico):
 
 
 def test_ler_entrega_de_quem_nao_entregou(servico):
-    servico._entregas = [{"id": "e2", "userId": "u2", "state": "CREATED"}]
+    servico._entregas = [{"id": "e2", "userId": "u2", "state": "CREATED",
+             "associatedWithDeveloper": True}]
 
     retorno = sala.ler_entrega("3A", "Prova 1", "Bruno")
 
@@ -291,6 +295,8 @@ def test_ler_entrega_mostra_resposta_do_aluno(servico):
             "id": "e1",
             "userId": "u1",
             "state": "TURNED_IN",
+            "associatedWithDeveloper": True,
+            "associatedWithDeveloper": True,
             "shortAnswerSubmission": {"answer": "A resposta é 42."},
         }
     ]
@@ -311,6 +317,8 @@ def test_ler_entrega_abre_o_arquivo_do_drive(servico, monkeypatch):
             "id": "e1",
             "userId": "u1",
             "state": "TURNED_IN",
+            "associatedWithDeveloper": True,
+            "associatedWithDeveloper": True,
             "assignmentSubmission": {
                 "attachments": [
                     {"driveFile": {"id": "d1", "title": "trabalho.pdf"}}
@@ -345,6 +353,8 @@ def test_ler_entrega_avisa_sobre_anexo_que_nao_da_para_abrir(servico):
             "id": "e1",
             "userId": "u1",
             "state": "TURNED_IN",
+            "associatedWithDeveloper": True,
+            "associatedWithDeveloper": True,
             "assignmentSubmission": {
                 "attachments": [
                     {"youTubeVideo": {"title": "Minha apresentação"}}
@@ -440,6 +450,10 @@ def test_prazo_noturno_avanca_o_dia_em_utc():
     corpo, erro = sala._montar_prazo("25/12/2026 23:59")
 
     assert erro is None
+    # A data local vai junto, para a confirmação falada dizer 25/12 e
+    # não 26/12, que é a data em UTC.
+    assert corpo["_local"].day == 25
+    assert corpo["_local"].hour == 23
     # 23:59 em Brasília é 02:59 do dia seguinte em UTC.
     assert corpo["dueDate"]["day"] == 26
     assert corpo["dueTime"]["hours"] == 2
@@ -550,8 +564,139 @@ def test_link_do_questionario_vira_anexo(servico, monkeypatch):
 
 def test_nao_devolve_sem_nota_lancada(servico):
     """Devolver sem nota não faz sentido e confunde o aluno."""
-    servico._entregas = [{"id": "e1", "userId": "u1", "state": "TURNED_IN"}]
+    servico._entregas = [{"id": "e1", "userId": "u1", "state": "TURNED_IN",
+             "associatedWithDeveloper": True}]
 
     resultado = sala.devolver_atividade("3A", "Prova 1", "Ana")
 
     assert "ainda não tem nota" in resultado
+
+
+# ============================================================
+# Atividade que nao pertence a este projeto
+# ============================================================
+#
+# Caso real: o lancamento de nota falhava com
+# "403 @ProjectPermissionDenied". O Google Classroom so deixa um
+# projeto externo lancar nota em atividades criadas por ele mesmo; as
+# que o professor criou pela interface sao somente leitura. Das 21
+# entregas reais examinadas, zero pertenciam a este projeto.
+
+def test_nao_prepara_nota_de_atividade_criada_fora(servico):
+    servico._entregas = [
+        {
+            "id": "e1",
+            "userId": "u1",
+            "state": "TURNED_IN",
+            "associatedWithDeveloper": False,
+        }
+    ]
+
+    resultado = sala.preparar_nota("3A", "Prova 1", "Ana", "8")
+
+    assert "só permite que eu lance nota em atividades criadas por mim" in resultado
+    assert sala.nota_pendente() is None
+
+
+def test_recusa_explica_que_nao_e_permissao(servico):
+    """
+    Sem isto o modelo tenta reautorizar a conta, abrindo o navegador no
+    meio da correcao -- foi o que aconteceu de verdade.
+    """
+    servico._entregas = [
+        {
+            "id": "e1",
+            "userId": "u1",
+            "state": "TURNED_IN",
+            "associatedWithDeveloper": False,
+        }
+    ]
+
+    resultado = sala.preparar_nota("3A", "Prova 1", "Ana", "8")
+
+    assert "Não é permissão faltando" in resultado
+    assert "lança essa nota à mão" in resultado
+
+
+def test_nao_devolve_atividade_criada_fora(servico):
+    servico._entregas = [
+        {
+            "id": "e1",
+            "userId": "u1",
+            "state": "TURNED_IN",
+            "assignedGrade": 8,
+            "associatedWithDeveloper": False,
+        }
+    ]
+
+    resultado = sala.devolver_atividade("3A", "Prova 1", "Ana")
+
+    assert "criadas por mim" in resultado
+
+
+def test_erro_da_api_tambem_e_traduzido():
+    """Se escapar da checagem previa, a mensagem ainda tem que ser clara."""
+    from actions.classroom_actions import _executar
+
+    class RequisicaoFalsa:
+        def execute(self):
+            raise Exception(
+                '403 "@ProjectPermissionDenied The Developer Console '
+                'project is not permitted to make this request."'
+            )
+
+    _, erro = _executar(RequisicaoFalsa())
+
+    assert "criadas por mim" in erro
+    assert "regra da plataforma" in erro or "Não é permissão faltando" in erro
+
+
+def test_instrucao_proibe_reautorizar_por_causa_disso():
+    # O texto da instrução é quebrado em várias linhas no código, então
+    # a busca é por trechos que cabem numa linha só.
+    assert "reautorizar conta por causa disso" in CODIGO_CLIENTE
+    assert "somente leitura para você" in CODIGO_CLIENTE
+
+
+def test_campo_auxiliar_nao_vai_para_a_api(servico, monkeypatch):
+    """A API recusaria um campo desconhecido no corpo."""
+    criados = []
+
+    def create_falso(courseId=None, body=None):
+        criados.append(body)
+
+        class R:
+            def execute(self):
+                return {"id": "novo"}
+
+        return R()
+
+    monkeypatch.setattr(servico, "create", create_falso, raising=False)
+
+    sala.criar_atividade("3A", "Trabalho", prazo="25/12/2026 23:59")
+
+    assert "_local" not in criados[0]
+    assert criados[0]["dueDate"]["day"] == 26
+
+
+def test_confirmacao_diz_a_data_que_o_professor_pediu(servico, monkeypatch):
+    """
+    O professor pedia 25/12 as 23:59 e ouvia "prazo 26/12", que e a
+    data em UTC -- como se ele tivesse errado.
+    """
+
+    def create_falso(courseId=None, body=None):
+        class R:
+            def execute(self):
+                return {"id": "novo"}
+
+        return R()
+
+    monkeypatch.setattr(servico, "create", create_falso, raising=False)
+
+    resultado = sala.criar_atividade(
+        "3A", "Trabalho", prazo="25/12/2026 23:59"
+    )
+
+    assert "25/12 às 23:59" in resultado
+    assert "26/12" not in resultado

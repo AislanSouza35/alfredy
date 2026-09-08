@@ -50,6 +50,41 @@ ESCOPOS = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
+# Sem estes o token não serve para nada e a conta é descartada.
+#
+# A separação existe porque a verificação era tudo-ou-nada: bastou
+# acrescentar o escopo da agenda para as duas contas serem dadas como
+# não autorizadas, e o lançamento de notas -- que nada tem a ver com
+# agenda -- parou de funcionar no meio do trabalho do professor.
+#
+# Um recurso novo agora desabilita apenas ele mesmo.
+ESCOPOS_ESSENCIAIS = [
+    "https://www.googleapis.com/auth/classroom.courses.readonly",
+    "https://www.googleapis.com/auth/classroom.coursework.students",
+    "https://www.googleapis.com/auth/classroom.rosters.readonly",
+    "https://www.googleapis.com/auth/classroom.student-submissions.students.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+# O que cada recurso opcional exige, para a recusa dizer exatamente o
+# que falta em vez de um "não autorizado" genérico.
+ESCOPOS_POR_RECURSO = {
+    "entregas": ["https://www.googleapis.com/auth/drive.readonly"],
+    "forms": [
+        "https://www.googleapis.com/auth/forms.body",
+        "https://www.googleapis.com/auth/drive.file",
+    ],
+    "documentos": ["https://www.googleapis.com/auth/drive.file"],
+    "agenda": ["https://www.googleapis.com/auth/calendar.events"],
+}
+
+NOMES_DE_RECURSO = {
+    "entregas": "ler os arquivos entregues pelos alunos",
+    "forms": "criar questionários",
+    "documentos": "criar apresentação, documento e planilha",
+    "agenda": "usar o Google Calendar",
+}
+
 _LOCK = Lock()
 
 # Serviços já montados, por e-mail.
@@ -100,12 +135,15 @@ def _carregar_credenciais(caminho):
         return None
 
     concedidos = set(guardado.get("scopes") or [])
-    if not set(ESCOPOS).issubset(concedidos):
+
+    # Só o essencial derruba a conta. Faltar o escopo de um recurso
+    # opcional desabilita aquele recurso, não a conta inteira.
+    if not set(ESCOPOS_ESSENCIAIS).issubset(concedidos):
         return None
 
     try:
         credenciais = Credentials.from_authorized_user_file(
-            str(caminho), ESCOPOS
+            str(caminho), sorted(concedidos)
         )
     except (ValueError, json.JSONDecodeError, OSError):
         return None
@@ -113,17 +151,74 @@ def _carregar_credenciais(caminho):
     if credenciais.expired and credenciais.refresh_token:
         try:
             credenciais.refresh(Request())
-            _gravar_token(caminho, credenciais)
+            _gravar_token(caminho, credenciais, concedidos)
         except Exception:
             return None
 
     return credenciais if credenciais.valid else None
 
 
-def _gravar_token(caminho, credenciais):
+def escopos_da_conta(email):
+    """Devolve o conjunto de escopos que o Google concedeu a esta conta."""
+
+    caminho = caminho_token(email)
+
+    if not caminho.is_file():
+        return set()
+
+    try:
+        return set(
+            json.loads(caminho.read_text(encoding="utf-8")).get("scopes") or []
+        )
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def falta_para_recurso(email, recurso):
+    """
+    Diz o que impede esta conta de usar um recurso.
+
+    Devolve None quando está tudo certo, ou a frase a ser dita.
+    """
+
+    exigidos = ESCOPOS_POR_RECURSO.get(recurso, [])
+    concedidos = escopos_da_conta(email)
+
+    faltando = [e for e in exigidos if e not in concedidos]
+    if not faltando:
+        return None
+
+    return (
+        f"A conta {email} ainda não tem permissão para "
+        f"{NOMES_DE_RECURSO.get(recurso, recurso)}. "
+        "Diga ao usuário que ele precisa autorizar essa conta de novo, "
+        "e NÃO faça isso no meio de outra tarefa: termine o que está "
+        "fazendo primeiro."
+    )
+
+
+def _gravar_token(caminho, credenciais, escopos_concedidos=None):
+    """
+    Grava o token preservando os escopos que o Google realmente deu.
+
+    credenciais.to_json() escreve os escopos PEDIDOS, não os
+    concedidos, porque from_authorized_user_file(caminho, ESCOPOS)
+    preenche o objeto com a lista pedida. Ao renovar um token, isso
+    reescrevia o arquivo afirmando permissões que nunca foram dadas --
+    e a verificação criada justamente para não mentir passava a mentir.
+    """
+
     PASTA.mkdir(parents=True, exist_ok=True)
+
+    dados = json.loads(credenciais.to_json())
+
+    if escopos_concedidos is not None:
+        dados["scopes"] = sorted(escopos_concedidos)
+
     temporario = caminho.with_suffix(".tmp")
-    temporario.write_text(credenciais.to_json(), encoding="utf-8")
+    temporario.write_text(
+        json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     substituir_com_retentativa(temporario, caminho)
 
 
@@ -205,10 +300,21 @@ def autorizar_conta():
             "Tente de novo."
         )
 
-    _gravar_token(caminho_token(email), credenciais)
+    # O Google pode conceder menos do que foi pedido, se o usuário
+    # desmarcar alguma permissão na tela de consentimento.
+    concedidos = set(credenciais.scopes or ESCOPOS)
+    _gravar_token(caminho_token(email), credenciais, concedidos)
 
     with _LOCK:
         _cache.pop(email, None)
+
+    faltando = [e for e in ESCOPOS if e not in concedidos]
+    if faltando:
+        nomes = ", ".join(e.split("/auth/")[-1] for e in faltando)
+        return (
+            f"Conta {email} autorizada, mas sem estas permissões: {nomes}. "
+            "Os recursos que dependem delas não vão funcionar."
+        )
 
     return f"Conta {email} autorizada com sucesso."
 

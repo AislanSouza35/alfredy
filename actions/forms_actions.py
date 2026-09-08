@@ -13,7 +13,7 @@ não ao restante do Drive do professor.
 
 import unicodedata
 
-from actions.classroom_contas import servicos
+from actions.classroom_contas import falta_para_recurso, servicos
 
 
 # Limites de sanidade, para um erro de transcrição não gerar um
@@ -54,6 +54,10 @@ def _servico_forms(email=None):
             )
     else:
         escolhida = (contas[0][0], contas[0][2])
+
+    pendente = falta_para_recurso(escolhida[0], "forms")
+    if pendente:
+        return None, None, pendente
 
     try:
         from googleapiclient.discovery import build

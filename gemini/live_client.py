@@ -9,6 +9,7 @@ import asyncio
 import random
 import re
 import sys
+import threading
 # time é utilizado para medir intervalos.
 # Aqui ele ajuda principalmente no controle de repetição
 # das funções visuais.
@@ -235,6 +236,20 @@ BLOCO = 1024
 # perceptivelmente o início da fala.
 BLOCO_SAIDA = 2400
 
+# Áudio acumulado antes de começar a tocar, em segundos.
+#
+# O Gemini manda a resposta em rajadas, não num fluxo constante. Sem
+# acumular um pouco antes, a placa de som fica sem dados entre uma
+# rajada e outra, e é isso que se ouve como picote. Duzentos e
+# cinquenta milissegundos cobrem a variação da rede sem que o começo
+# da fala pareça atrasado.
+PRE_BUFFER_SEGUNDOS = 0.25
+
+# Quanto áudio a fila de saída pode acumular antes de virar problema.
+# Passar disso significa que a reprodução não está acompanhando; o
+# aviso vai para o log em vez de crescer sem limite em silêncio.
+LIMITE_AVISO_FILA_SAIDA = 80
+
 # Tempo de segurança antes de reabrir o microfone depois
 # que o ALFRED termina de reproduzir a resposta.
 ATRASO_REABRIR_MICROFONE = 0.8
@@ -299,6 +314,43 @@ TEMPO_LIMITE_CONEXAO = 30
 # microfone. Existe só como rede de segurança: se a placa de som travar,
 # o microfone volta mesmo assim em vez de ficar fechado para sempre.
 TEMPO_MAXIMO_ESPERANDO_AUDIO = 45.0
+
+
+class BufferDeAudio:
+    """
+    Guarda o áudio entre a rede e a placa de som.
+
+    Antes, cada bloco recebido era escrito com asyncio.to_thread, que
+    usa o mesmo pool de threads das ferramentas. Enquanto o Classroom
+    lia entregas ou o Gemini analisava uma imagem, a escrita do áudio
+    entrava na fila atrás delas e a placa de som ficava sem dados --
+    era isso que se ouvia como corte.
+
+    Agora a placa puxa sozinha, na thread de alta prioridade dela, e a
+    reprodução deixa de depender do laço de eventos estar livre.
+    """
+
+    def __init__(self):
+        self._dados = bytearray()
+        self._lock = threading.Lock()
+
+    def acrescentar(self, bloco):
+        with self._lock:
+            self._dados.extend(bloco)
+
+    def retirar(self, quantidade):
+        with self._lock:
+            pedaco = bytes(self._dados[:quantidade])
+            del self._dados[:quantidade]
+        return pedaco
+
+    def tamanho(self):
+        with self._lock:
+            return len(self._dados)
+
+    def limpar(self):
+        with self._lock:
+            self._dados.clear()
 
 
 # Classe principal do cliente em tempo real.
@@ -373,13 +425,18 @@ class GeminiLiveWorker(QThread):
         # Fila de blocos de áudio esperando para tocar. O microfone só
         # pode reabrir depois que ela esvazia.
         self.fila_saida = None
-        # True enquanto um bloco está sendo entregue à placa de som.
+        # True enquanto ainda existe áudio para tocar.
         self.reproduzindo_bloco = False
+        # Áudio esperando a placa de som consumir.
+        self.buffer_audio = BufferDeAudio()
         # Referência para a tarefa que reativa o microfone
         # depois que o ALFRED termina de falar.
         self.tarefa_liberar_microfone = None
         # Referência para a tarefa de encerramento por voz.
         self.tarefa_encerramento = None
+
+        # Envio do audio_stream_end fora do laço de leitura.
+        self.tarefa_fim_de_fluxo = None
         # Referência para a execução em segundo plano da ferramenta
         # solicitada pelo modelo. Rodar em segundo plano evita que
         # chamadas demoradas (ex.: clique visual) travem o recebimento
@@ -1381,7 +1438,11 @@ class GeminiLiveWorker(QThread):
                             "veem até o professor publicar no Classroom. "
                             "Diga isso a ele depois de criar. "
                             "Use para 'cria uma atividade', 'monta um "
-                            "trabalho', 'passa um exercício'."
+                            "trabalho', 'passa um exercício'. "
+                            "Pode anexar um arquivo do computador. Quando o "
+                            "arquivo for para o aluno preencher e devolver, "
+                            "use modo_arquivo='copia', que dá uma cópia "
+                            "individual a cada um."
                         ),
                         parameters=types.Schema(
                             type="OBJECT",
@@ -1418,6 +1479,29 @@ class GeminiLiveWorker(QThread):
                                     description=(
                                         "Link a anexar, como o de um "
                                         "questionário recém-criado."
+                                    ),
+                                ),
+                                "arquivo": types.Schema(
+                                    type="STRING",
+                                    description=(
+                                        "Nome de um arquivo do computador "
+                                        "para anexar, como o usuário falou. "
+                                        "Exemplo: 'lista de exercicios' ou "
+                                        "'roteiro.pdf'. Procura na Área de "
+                                        "Trabalho, Documentos e Downloads."
+                                    ),
+                                ),
+                                "modo_arquivo": types.Schema(
+                                    type="STRING",
+                                    description=(
+                                        "Como o aluno recebe o arquivo: "
+                                        "'ver' para apenas ler, 'copia' "
+                                        "para cada aluno ganhar uma cópia "
+                                        "própria para preencher e entregar, "
+                                        "'editar' para todos editarem o "
+                                        "mesmo. O padrão é 'ver'. Se o "
+                                        "arquivo for para o aluno responder, "
+                                        "use 'copia'."
                                     ),
                                 ),
                             },
@@ -2373,6 +2457,11 @@ class GeminiLiveWorker(QThread):
                 "Se ele disser que tem turmas num e-mail que você não "
                 "enxerga, chame autorizar_conta e avise que o navegador vai "
                 "abrir para ele escolher a conta. "
+                "NUNCA chame autorizar_conta no meio de outra tarefa. Ela "
+                "abre o navegador e interrompe o que o usuário está fazendo. "
+                "Se uma função disser que falta permissão, TERMINE o que "
+                "está fazendo, conte o que aconteceu e deixe o usuário "
+                "decidir quando reautorizar. "
                 "Use listar_turmas, listar_atividades e listar_entregas para "
                 "consultar, e ler_entrega para ver o que um aluno respondeu. "
                 "Nunca tente corrigir o Classroom clicando na tela: as "
@@ -2397,6 +2486,16 @@ class GeminiLiveWorker(QThread):
                 "substituída antes de confirmar. "
                 "Depois de corrigir, ofereça devolver_atividade: só depois "
                 "de devolvida o aluno enxerga a nota. "
+                "LIMITE IMPORTANTE: o Google Classroom só deixa você lançar "
+                "nota em atividades criadas por você mesmo, com "
+                "criar_atividade. As que o professor criou pela interface do "
+                "Classroom são somente leitura para você. Isso é regra da "
+                "plataforma, não permissão faltando: não peça para "
+                "reautorizar conta por causa disso, e não insista. "
+                "Quando acontecer, explique com clareza e ofereça as duas "
+                "saídas: lançar à mão, ou criar as próximas atividades por "
+                "você. Ler entregas e conteúdo continua funcionando em "
+                "qualquer atividade. "
 
                 # =========================
                 # CRIAR ATIVIDADE E QUESTIONÁRIO
@@ -2615,6 +2714,8 @@ class GeminiLiveWorker(QThread):
                     self.usuario_falando_detectado = False
                     self.ultimo_audio_com_voz = None
                     self.reproduzindo_bloco = False
+                    self.tarefa_fim_de_fluxo = None
+                    self.buffer_audio.limpar()
 
                     # Uma captura que ficou pendente antes da queda já não
                     # representa a tela atual. Descarta para o ALF nunca
@@ -2706,6 +2807,9 @@ class GeminiLiveWorker(QThread):
 
                     if self.tarefa_ferramenta_atual:
                         self.tarefa_ferramenta_atual.cancel()
+
+                    if self.tarefa_fim_de_fluxo:
+                        self.tarefa_fim_de_fluxo.cancel()
 
                     # Aguarda o encerramento das tarefas.
                     # return_exceptions=True evita que cancelamentos
@@ -2964,9 +3068,13 @@ class GeminiLiveWorker(QThread):
 
                 # resposta.data contém bytes de áudio gerados pelo Gemini.
                 if resposta.data:
+                    # aguardar_envio=False: este laço não pode parar
+                    # para esperar um envio, senão o socket deixa de
+                    # ser drenado e o servidor aborta com 1008.
                     await self.preparar_pausa_microfone(
                         sessao,
                         fila_microfone,
+                        aguardar_envio=False,
                     )
 
                     # Só reproduz quando o turno não foi marcado
@@ -2983,6 +3091,7 @@ class GeminiLiveWorker(QThread):
                     await self.preparar_pausa_microfone(
                         sessao,
                         fila_microfone,
+                        aguardar_envio=False,
                     )
                     self.agendar_chamada_de_funcao(
                         sessao,
@@ -3806,6 +3915,8 @@ class GeminiLiveWorker(QThread):
                     self.status_recebido.emit(
                         f"Criando atividade: {args.get('titulo', '')}"
                     )
+                    # Enviar arquivo para o Drive pode demorar, então o
+                    # prazo é maior que o das outras ações.
                     resultado = await self.executar_funcao_local(
                         criar_atividade,
                         args.get("turma", ""),
@@ -3814,7 +3925,9 @@ class GeminiLiveWorker(QThread):
                         args.get("pontos", ""),
                         args.get("prazo", ""),
                         args.get("link", ""),
-                        timeout=60,
+                        args.get("arquivo", ""),
+                        args.get("modo_arquivo", "ver"),
+                        timeout=180,
                     )
 
                 # Devolve o trabalho corrigido ao aluno.
@@ -4128,6 +4241,8 @@ class GeminiLiveWorker(QThread):
                         "Função desconhecida. Nenhuma ação foi executada."
                     )
 
+                self.registrar_resultado_de_ferramenta(nome, resultado)
+
                 # Adiciona o resultado da função à lista de respostas.
                 function_responses.append(
                     types.FunctionResponse(
@@ -4429,7 +4544,15 @@ class GeminiLiveWorker(QThread):
         self,
         sessao,
         fila_microfone,
+        aguardar_envio=True,
     ):
+        """
+        Fecha o microfone enquanto o ALF fala.
+
+        aguardar_envio=False existe para quem chama de dentro do laço
+        que lê o WebSocket. Ver _agendar_fim_do_fluxo.
+        """
+
         self.alfred_falando = True
 
         if self.tarefa_liberar_microfone:
@@ -4438,7 +4561,42 @@ class GeminiLiveWorker(QThread):
         self.limpar_fila_microfone(
             fila_microfone
         )
-        await self.finalizar_fluxo_audio_pendente(sessao)
+
+        if aguardar_envio:
+            await self.finalizar_fluxo_audio_pendente(sessao)
+        else:
+            self._agendar_fim_do_fluxo(sessao)
+
+    def _agendar_fim_do_fluxo(self, sessao):
+        """
+        Envia o audio_stream_end sem travar quem chamou.
+
+        O laço que lê o WebSocket chamava preparar_pausa_microfone a
+        cada bloco de áudio recebido, e isso esperava pelo lock de
+        envio -- que o microfone segura enquanto manda o bloco dele.
+        Numa conexão congestionada, que é justamente quando o áudio
+        começa a picotar, a leitura parava, o socket deixava de ser
+        drenado e o servidor abortava a sessão com o código 1008.
+
+        Agendar em vez de esperar mantém a leitura sempre correndo.
+        """
+
+        if not self.fluxo_audio_em_andamento:
+            return
+
+        anterior = self.tarefa_fim_de_fluxo
+        if anterior is not None and not anterior.done():
+            return
+
+        async def enviar():
+            try:
+                await self.finalizar_fluxo_audio_pendente(sessao)
+            except Exception as erro:
+                self.registrar_diagnostico(
+                    f"Falha ao encerrar o fluxo de audio: {repr(erro)}"
+                )
+
+        self.tarefa_fim_de_fluxo = asyncio.create_task(enviar())
 
     def agendar_liberacao_microfone(self):
         if self.tarefa_liberar_microfone:
@@ -4458,17 +4616,42 @@ class GeminiLiveWorker(QThread):
         # verificar se ainda existe áudio esperando para tocar.
         self.fila_saida = fila_saida
 
-        # Abre o dispositivo de saída em PCM bruto.
+        self.buffer_audio.limpar()
+        buffer = self.buffer_audio
+
+        # A placa de som chama isto sozinha, na thread dela. Só copia
+        # bytes de um buffer em memória: nada de rede, nada de espera.
+        # Faltando áudio, preenche com silêncio em vez de travar.
+        def alimentar(saida_bruta, quadros, tempo, situacao):
+            necessario = quadros * 2  # int16 mono
+            pedaco = buffer.retirar(necessario)
+
+            if len(pedaco) < necessario:
+                saida_bruta[: len(pedaco)] = pedaco
+                saida_bruta[len(pedaco):] = b"\x00" * (necessario - len(pedaco))
+            else:
+                saida_bruta[:] = pedaco
+
+        # latency="high" dá ao PortAudio um buffer interno maior, o que
+        # ajuda a absorver a irregularidade com que o áudio chega.
         with sd.RawOutputStream(
             samplerate=TAXA_SAIDA,
             blocksize=BLOCO_SAIDA,
             dtype="int16",
             channels=CANAIS,
-        ) as saida:
-            # Continua lendo e enviando áudio enquanto a sessão estiver ativa.
+            latency="high",
+            callback=alimentar,
+        ):
             while self.ativo:
-                # Aguarda o próximo bloco de áudio.
                 audio_bytes = await fila_saida.get()
+
+                # Começo de uma fala: acumula um pouco antes de entregar.
+                # Sem isto o primeiro trecho sai picotado, porque a placa
+                # consome mais rápido do que a rede entrega.
+                if buffer.tamanho() == 0:
+                    audio_bytes += await self.acumular_pre_buffer(fila_saida)
+
+                buffer.acrescentar(audio_bytes)
 
                 # Mantém o microfone bloqueado durante toda a reprodução
                 # e descarta qualquer bloco antigo que ainda tenha sobrado.
@@ -4479,25 +4662,42 @@ class GeminiLiveWorker(QThread):
                 )
 
                 # Calcula o volume para animação da interface.
-                nivel = self.calcular_nivel_audio(
-                    audio_bytes
-                )
-
                 self.nivel_audio.emit(
-                    nivel
+                    self.calcular_nivel_audio(audio_bytes)
                 )
 
-                try:
-                    # Reproduz em uma thread auxiliar.
-                    # Isso evita que drivers de áudio mais lentos bloqueiem
-                    # o loop que recebe os próximos blocos do Gemini.
-                    await asyncio.to_thread(
-                        saida.write,
-                        audio_bytes,
-                    )
+    async def acumular_pre_buffer(self, fila_saida):
+        """
+        Junta um pouco de áudio antes de começar a tocar.
 
-                finally:
-                    self.reproduzindo_bloco = False
+        Devolve os bytes extras. Espera no máximo o tempo do próprio
+        amortecedor: se a resposta for curta e não vier mais nada, toca
+        o que tem em vez de segurar a fala.
+        """
+
+        alvo = int(TAXA_SAIDA * PRE_BUFFER_SEGUNDOS) * 2  # 2 bytes por amostra
+        juntado = bytearray()
+        prazo = time.monotonic() + PRE_BUFFER_SEGUNDOS
+
+        while len(juntado) < alvo:
+            restante = prazo - time.monotonic()
+            if restante <= 0:
+                break
+
+            try:
+                juntado += await asyncio.wait_for(
+                    fila_saida.get(), timeout=restante
+                )
+            except asyncio.TimeoutError:
+                break
+
+        if fila_saida.qsize() > LIMITE_AVISO_FILA_SAIDA:
+            self.registrar_diagnostico(
+                f"Fila de audio acumulada: {fila_saida.qsize()} blocos. "
+                "A reproducao nao esta acompanhando a rede."
+            )
+
+        return bytes(juntado)
 
     @staticmethod
     def limpar_fila_microfone(
@@ -4515,6 +4715,47 @@ class GeminiLiveWorker(QThread):
 
             except asyncio.QueueEmpty:
                 break
+
+    # Trechos que denunciam uma ferramenta que não fez o que devia.
+    SINAIS_DE_FALHA = (
+        "não consegui",
+        "não posso",
+        "não encontrei",
+        "não tenho",
+        "não está",
+        "recusou",
+        "bloqueado",
+        "foi recusad",
+        "falhei",
+        "erro",
+        "expirou",
+        "limite",
+    )
+
+    @classmethod
+    def registrar_resultado_de_ferramenta(cls, nome, resultado):
+        """
+        Registra no log a ferramenta que falhou.
+
+        Quando o lançamento de nota parou de funcionar, o erro voltava
+        para o modelo e sumia: não havia como saber depois o que tinha
+        acontecido. Sem isto, diagnosticar dependia de reproduzir o
+        problema ao vivo.
+
+        Só falhas são registradas, e apenas o começo da mensagem: o
+        resultado de uma ferramenta costuma trazer nome e trabalho de
+        aluno, que não têm por que ficar guardados em arquivo.
+        """
+
+        texto = str(resultado or "")
+        minusculo = texto.lower()
+
+        if not any(sinal in minusculo for sinal in cls.SINAIS_DE_FALHA):
+            return
+
+        cls.registrar_diagnostico(
+            f"Ferramenta '{nome}' nao concluiu: {texto[:160]}"
+        )
 
     # O método seguinte não depende do objeto self.
     @staticmethod
@@ -4720,7 +4961,12 @@ class GeminiLiveWorker(QThread):
                 or self.fila_saida.empty()
             )
 
-            if fila_vazia and not self.reproduzindo_bloco:
+            # O buffer é o que a placa de som ainda vai tocar: enquanto
+            # tiver bytes ali, o ALF continua falando.
+            buffer_vazio = self.buffer_audio.tamanho() == 0
+
+            if fila_vazia and buffer_vazio:
+                self.reproduzindo_bloco = False
                 return True
 
             await asyncio.sleep(0.05)

@@ -218,8 +218,10 @@ def test_receber_audio_nao_bloqueia_leitura_enquanto_ferramenta_roda():
                 worker.ativo = False
                 yield resposta_final
 
-        async def preparar_pausa_microfone(sessao, fila):
-            ordem.append("microfone_pausado")
+        async def preparar_pausa_microfone(sessao, fila, aguardar_envio=True):
+            # O laço de leitura chama com aguardar_envio=False: ele não
+            # pode parar para esperar um envio de rede.
+            ordem.append(f"microfone_pausado(aguardar={aguardar_envio})")
 
         async def processar_chamada_de_funcao(sessao, tool_call, fila):
             ordem.append("ferramenta_iniciada")
@@ -239,6 +241,8 @@ def test_receber_audio_nao_bloqueia_leitura_enquanto_ferramenta_roda():
         # A leitura seguiu adiante com a ferramenta ainda em execução.
         assert "segunda_resposta_lida" in ordem
         assert "ferramenta_finalizada" not in ordem
+        # E não esperou por nenhum envio de rede no caminho.
+        assert "microfone_pausado(aguardar=False)" in ordem
 
         liberar_ferramenta.set()
         await asyncio.wait_for(
@@ -546,3 +550,313 @@ def test_aguardar_fim_da_reproducao_respeita_o_limite():
         assert concluiu is False
 
     asyncio.run(executar())
+
+
+# ============================================================
+# O laço de leitura não pode esperar por um envio
+# ============================================================
+#
+# Caso real: o áudio começava a picotar e a conexão caía com o código
+# 1008 (policy violation, "The operation was aborted").
+#
+# A causa: receber_audio chamava preparar_pausa_microfone a cada bloco
+# de áudio recebido, e isso esperava pelo lock de envio -- que o
+# microfone segura enquanto manda o bloco dele. Numa conexão
+# congestionada, que é justamente quando o áudio picota, a leitura
+# parava, o socket deixava de ser drenado e o servidor abortava.
+
+def test_leitura_nao_espera_envio_ao_receber_audio():
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.lock_envio = asyncio.Lock()
+        fila_saida = asyncio.Queue()
+        fila_microfone = asyncio.Queue()
+        pedidos = []
+
+        async def preparar_falso(sessao, fila, aguardar_envio=True):
+            pedidos.append(aguardar_envio)
+
+        worker.preparar_pausa_microfone = preparar_falso
+
+        resposta = SimpleNamespace(
+            data=b"audio",
+            tool_call=None,
+            session_resumption_update=None,
+            go_away=None,
+            server_content=None,
+        )
+
+        class SessaoFake:
+            async def receive(self):
+                yield resposta
+                worker.ativo = False
+
+        await asyncio.wait_for(
+            worker.receber_audio(SessaoFake(), fila_saida, fila_microfone),
+            timeout=1,
+        )
+
+        assert pedidos == [False], "o laço de leitura nao pode esperar envio"
+
+    asyncio.run(executar())
+
+
+def test_fim_de_fluxo_agendado_nao_bloqueia_quem_chama():
+    """O audio_stream_end sai numa tarefa propria, nao no laço."""
+
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.lock_envio = asyncio.Lock()
+        worker.fluxo_audio_em_andamento = True
+        fila = asyncio.Queue()
+
+        liberar = asyncio.Event()
+        enviados = []
+
+        class SessaoLenta:
+            async def send_realtime_input(self, **kwargs):
+                await liberar.wait()
+                enviados.append(kwargs)
+
+        sessao = SessaoLenta()
+
+        # Mesmo com o envio travado, isto retorna na hora.
+        await asyncio.wait_for(
+            worker.preparar_pausa_microfone(sessao, fila, aguardar_envio=False),
+            timeout=0.5,
+        )
+
+        assert enviados == []
+        assert worker.tarefa_fim_de_fluxo is not None
+
+        liberar.set()
+        await asyncio.wait_for(worker.tarefa_fim_de_fluxo, timeout=1)
+
+        assert enviados == [{"audio_stream_end": True}]
+
+    asyncio.run(executar())
+
+
+def test_fim_de_fluxo_nao_agenda_duas_vezes():
+    """Um bloco de áudio por vez chega; não pode virar uma tarefa cada."""
+
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.lock_envio = asyncio.Lock()
+        worker.fluxo_audio_em_andamento = True
+        liberar = asyncio.Event()
+
+        class SessaoLenta:
+            async def send_realtime_input(self, **kwargs):
+                await liberar.wait()
+
+        sessao = SessaoLenta()
+
+        worker._agendar_fim_do_fluxo(sessao)
+        primeira = worker.tarefa_fim_de_fluxo
+        worker._agendar_fim_do_fluxo(sessao)
+
+        assert worker.tarefa_fim_de_fluxo is primeira
+
+        liberar.set()
+        await asyncio.wait_for(primeira, timeout=1)
+
+    asyncio.run(executar())
+
+
+# ============================================================
+# Amortecedor contra o picote
+# ============================================================
+
+def test_pre_buffer_junta_audio_antes_de_tocar():
+    """
+    O Gemini manda a resposta em rajadas. Sem acumular um pouco, a
+    placa de som fica sem dados entre uma rajada e outra -- que e o
+    que se ouve como picote.
+    """
+
+    async def executar():
+        worker = GeminiLiveWorker()
+        fila = asyncio.Queue()
+
+        # Tres blocos pequenos ja esperando.
+        for _ in range(3):
+            fila.put_nowait(b"\x00" * 1000)
+
+        extra = await worker.acumular_pre_buffer(fila)
+
+        assert len(extra) == 3000
+
+    asyncio.run(executar())
+
+
+def test_pre_buffer_nao_segura_fala_curta():
+    """Resposta curta nao pode ficar presa esperando encher o buffer."""
+
+    async def executar():
+        import gemini.live_client as live_client
+
+        worker = GeminiLiveWorker()
+        fila = asyncio.Queue()
+
+        inicio = time.monotonic()
+        extra = await worker.acumular_pre_buffer(fila)
+        duracao = time.monotonic() - inicio
+
+        assert extra == b""
+        # Espera no maximo o proprio tempo do amortecedor.
+        assert duracao < live_client.PRE_BUFFER_SEGUNDOS + 0.3
+
+    asyncio.run(executar())
+
+
+# ============================================================
+# Reprodução por callback
+# ============================================================
+#
+# Antes cada bloco era escrito com asyncio.to_thread, que usa o mesmo
+# pool das ferramentas. Enquanto o Classroom lia entregas, a escrita do
+# áudio entrava na fila atrás delas -- medido em 0,7 s de atraso
+# acumulado em 3 s de áudio, que é o que se ouve como corte.
+
+def test_buffer_devolve_o_que_foi_guardado():
+    from gemini.live_client import BufferDeAudio
+
+    buffer = BufferDeAudio()
+    buffer.acrescentar(b"abcdef")
+
+    assert buffer.tamanho() == 6
+    assert buffer.retirar(4) == b"abcd"
+    assert buffer.tamanho() == 2
+    assert buffer.retirar(10) == b"ef"
+    assert buffer.tamanho() == 0
+
+
+def test_buffer_devolve_menos_quando_falta_audio():
+    """A placa preenche o resto com silêncio em vez de travar."""
+    from gemini.live_client import BufferDeAudio
+
+    buffer = BufferDeAudio()
+    buffer.acrescentar(b"ab")
+
+    assert buffer.retirar(100) == b"ab"
+
+
+def test_buffer_limpa():
+    from gemini.live_client import BufferDeAudio
+
+    buffer = BufferDeAudio()
+    buffer.acrescentar(b"x" * 50)
+    buffer.limpar()
+
+    assert buffer.tamanho() == 0
+
+
+def test_buffer_aguenta_threads_concorrentes():
+    """A placa de som retira numa thread; o laço acrescenta em outra."""
+    import threading
+
+    from gemini.live_client import BufferDeAudio
+
+    buffer = BufferDeAudio()
+    erros = []
+
+    def escrever():
+        try:
+            for _ in range(200):
+                buffer.acrescentar(b"12345678")
+        except Exception as erro:
+            erros.append(erro)
+
+    def ler():
+        try:
+            for _ in range(200):
+                buffer.retirar(8)
+        except Exception as erro:
+            erros.append(erro)
+
+    threads = [threading.Thread(target=escrever) for _ in range(3)]
+    threads += [threading.Thread(target=ler) for _ in range(3)]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert erros == []
+
+
+def test_microfone_espera_o_buffer_esvaziar():
+    """
+    O microfone não pode reabrir com áudio ainda na fila da placa de
+    som: o ALF ouviria a própria voz.
+    """
+
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.fila_saida = asyncio.Queue()
+        worker.buffer_audio.acrescentar(b"\x00" * 4000)
+
+        concluiu = await worker.aguardar_fim_da_reproducao(limite=0.3)
+        assert concluiu is False
+
+        worker.buffer_audio.limpar()
+
+        concluiu = await worker.aguardar_fim_da_reproducao(limite=1)
+        assert concluiu is True
+
+    asyncio.run(executar())
+
+
+# ============================================================
+# Registro de falha de ferramenta
+# ============================================================
+
+def test_ferramenta_que_falha_e_registrada(tmp_path, monkeypatch):
+    """
+    Quando o lançamento de nota parou, o erro voltava para o modelo e
+    sumia: não havia como diagnosticar depois.
+    """
+    registrados = []
+    monkeypatch.setattr(
+        GeminiLiveWorker,
+        "registrar_diagnostico",
+        staticmethod(lambda mensagem, caminho=None: registrados.append(mensagem)),
+    )
+
+    GeminiLiveWorker.registrar_resultado_de_ferramenta(
+        "preparar_nota", "Não posso lançar nota nesta atividade."
+    )
+
+    assert registrados
+    assert "preparar_nota" in registrados[0]
+
+
+def test_ferramenta_bem_sucedida_nao_polui_o_log(monkeypatch):
+    registrados = []
+    monkeypatch.setattr(
+        GeminiLiveWorker,
+        "registrar_diagnostico",
+        staticmethod(lambda mensagem, caminho=None: registrados.append(mensagem)),
+    )
+
+    GeminiLiveWorker.registrar_resultado_de_ferramenta(
+        "listar_turmas", "Você tem 51 turmas ativas."
+    )
+
+    assert registrados == []
+
+
+def test_log_de_falha_nao_guarda_o_trabalho_do_aluno(monkeypatch):
+    """Resultado de ferramenta traz nome e trabalho de aluno."""
+    registrados = []
+    monkeypatch.setattr(
+        GeminiLiveWorker,
+        "registrar_diagnostico",
+        staticmethod(lambda mensagem, caminho=None: registrados.append(mensagem)),
+    )
+
+    longo = "Não consegui ler. " + ("dado do aluno " * 200)
+    GeminiLiveWorker.registrar_resultado_de_ferramenta("ler_entrega", longo)
+
+    assert len(registrados[0]) < 250

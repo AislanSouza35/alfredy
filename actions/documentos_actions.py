@@ -12,7 +12,7 @@ por este app; o resto do Drive continua fora de alcance.
 
 import unicodedata
 
-from actions.classroom_contas import servicos
+from actions.classroom_contas import falta_para_recurso, servicos
 
 
 # Limites de sanidade: um erro de transcrição não pode gerar um
@@ -54,6 +54,10 @@ def _servico(api, versao, conta=""):
             )
     else:
         escolhida = (contas[0][0], contas[0][2])
+
+    pendente = falta_para_recurso(escolhida[0], "documentos")
+    if pendente:
+        return None, None, pendente
 
     try:
         from googleapiclient.discovery import build

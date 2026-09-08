@@ -97,6 +97,80 @@ def obter_servico_drive(credenciais=None):
         return None, f"Não consegui acessar o Drive: {erro}"
 
 
+def enviar_arquivo_para_drive(caminho, credenciais=None):
+    """
+    Sobe um arquivo do computador para o Drive.
+
+    Serve para anexar material a uma atividade do Classroom: o anexo é
+    referenciado pelo identificador no Drive, então o arquivo precisa
+    estar lá antes.
+
+    O escopo usado é o drive.file, que só alcança o que este app cria.
+    Devolve (id, nome, erro).
+    """
+
+    import mimetypes
+    from pathlib import Path
+
+    servico, erro = obter_servico_drive(credenciais)
+    if erro:
+        return None, None, erro
+
+    try:
+        from googleapiclient.http import MediaFileUpload
+    except ImportError:
+        return None, None, "As bibliotecas do Google Drive não estão instaladas."
+
+    arquivo = Path(caminho)
+    if not arquivo.is_file():
+        return None, None, f"Não encontrei o arquivo {caminho}."
+
+    tipo, _ = mimetypes.guess_type(arquivo.name)
+
+    try:
+        enviado = servico.files().create(
+            body={"name": arquivo.name},
+            media_body=MediaFileUpload(
+                str(arquivo),
+                mimetype=tipo or "application/octet-stream",
+                resumable=True,
+            ),
+            fields="id,name",
+        ).execute()
+    except Exception as erro:
+        texto = str(erro)
+        if "SERVICE_DISABLED" in texto or "has not been used in project" in texto:
+            return None, None, (
+                "A API do Google Drive não está ativada no projeto do console."
+            )
+        return None, None, f"Não consegui enviar o arquivo: {erro}"
+
+    return enviado.get("id"), enviado.get("name", arquivo.name), None
+
+
+def liberar_para_a_turma(id_arquivo, credenciais=None):
+    """
+    Deixa o arquivo visível para quem tiver o link.
+
+    Sem isto o aluno abre o anexo e vê "você precisa de permissão": o
+    arquivo nasce privado na conta do professor.
+    """
+
+    servico, erro = obter_servico_drive(credenciais)
+    if erro:
+        return erro
+
+    try:
+        servico.permissions().create(
+            fileId=id_arquivo,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+    except Exception as erro:
+        return f"Não consegui liberar o acesso ao arquivo: {erro}"
+
+    return None
+
+
 # ============================================================
 # CONVERSÃO POR TIPO
 # ============================================================
