@@ -434,6 +434,9 @@ class GeminiLiveWorker(QThread):
         self.memoria_apertada = False
         # Quedas seguidas por cota esgotada da chave do Gemini.
         self.quedas_por_cota = 0
+        # Momento em que o usuário parou de falar, para medir a demora
+        # até a resposta começar.
+        self.momento_fim_da_fala = None
         # Guardará o loop assíncrono desta thread.
         self.loop = None
         # Limpa a referência da sessão encerrada.
@@ -2485,15 +2488,35 @@ class GeminiLiveWorker(QThread):
             "Use a palavra-chave apenas para comparar silenciosamente "
             "com o áudio recebido do usuário. "
             "Antes da autenticação, limite-se a solicitar a palavra-chave. "
-            "Depois de solicitá-la, pare de falar e aguarde uma resposta real. "
-            "Nunca preencha o silêncio e nunca continue a conversa sozinho. "
+            "Depois de pedir, aguarde a fala dele sem puxar assunto sozinho. "
             "Não trate sua própria voz, áudio reproduzido pelo computador, "
             "eco, ruído ou silêncio como tentativa de autenticação. "
+
+            # O reconhecimento de voz erra, e o nome é curto: 'Arlan' vira
+            # 'Arlã', 'Harlan', 'Alan'. Antes não havia regra para o que
+            # fazer nesse caso, e ele cumpria a parte do silêncio: o
+            # usuário respondia a palavra-chave e o ALF emudecia.
+            "Aceite variações próximas no som, porque o reconhecimento de "
+            "voz erra: 'Arlan', 'Arlã', 'Harlan', 'Alan', ou a palavra "
+            "dentro de uma frase. "
+            "Se o que ele falou NÃO for a palavra-chave, responda em UMA "
+            "frase curta que ainda falta a palavra-chave. "
+            "Se não tiver entendido o áudio, peça para repetir, em voz alta. "
+            "NUNCA fique calado depois de uma fala dele: silêncio parece "
+            "travamento, e é a pior resposta possível. O silêncio só vale "
+            "quando ele não falou nada. "
+
             "O usuário terá no máximo três tentativas incorretas. "
             "Após quatro erros consecutivos, bloqueie o acesso nesta chamada. "
-            "Se o usuário disser corretamente a palavra-chave, responda apenas "
-            "'Acesso autorizado' uma única vez e aguarde o próximo pedido. "
-            "Não repita 'Acesso autorizado' sem uma nova fala do usuário. "
+            "Se o usuário disser corretamente a palavra-chave, responda "
+            "'Acesso autorizado' uma única vez. "
+
+            # Sem isto ele continuava aplicando o portão depois de aberto,
+            # e voltava a emudecer no meio da conversa.
+            "A PARTIR DAÍ O PORTÃO ACABOU nesta chamada: não peça a "
+            "palavra-chave de novo, não volte a ficar em silêncio e "
+            "responda a tudo normalmente, usando as funções quando "
+            "precisar. "
             "Não execute funções nem prossiga com uma conversa completa "
             "antes da autenticação. "
 
@@ -3559,6 +3582,8 @@ class GeminiLiveWorker(QThread):
 
                 # resposta.data contém bytes de áudio gerados pelo Gemini.
                 if resposta.data:
+                    self.registrar_atraso_da_resposta()
+
                     # aguardar_envio=False: este laço não pode parar
                     # para esperar um envio, senão o socket deixa de
                     # ser drenado e o servidor aborta com 1008.
@@ -5036,6 +5061,30 @@ class GeminiLiveWorker(QThread):
             "Responda de forma objetiva."
         )
 
+    def registrar_atraso_da_resposta(self):
+        """
+        Grava quanto tempo o ALF levou para começar a responder.
+
+        "Demora muito para responder" é uma queixa que não dá para
+        investigar sem número. Mede do fim da fala do usuário até o
+        primeiro pedaço de áudio da resposta chegar.
+
+        Devolve os segundos, ou None quando não há fala esperando
+        resposta -- os pedaços seguintes do mesmo turno não contam.
+        """
+
+        if self.momento_fim_da_fala is None:
+            return None
+
+        atraso = time.monotonic() - self.momento_fim_da_fala
+        self.momento_fim_da_fala = None
+
+        self.registrar_diagnostico(
+            f"Resposta comecou {atraso:.1f}s depois de o usuario parar de falar."
+        )
+
+        return atraso
+
     async def abrir_conversa(self, sessao):
         """
         Faz o ALF falar primeiro, assim que a chamada abre.
@@ -5166,6 +5215,7 @@ class GeminiLiveWorker(QThread):
             self.fluxo_audio_em_andamento = False
             self.usuario_falando_detectado = False
             self.ultimo_audio_com_voz = None
+            self.momento_fim_da_fala = time.monotonic()
             self.registrar_diagnostico(
                 "Fluxo de audio do microfone finalizado com audio_stream_end."
             )
