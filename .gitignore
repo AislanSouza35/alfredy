@@ -19,6 +19,8 @@ memory/memory.json
 memory/preferencias.json
 memory/contatos.json
 memory/agenda.json
+# Comentário de cada aluno esperando a devolução: dado de aluno.
+memory/comentarios_pendentes.json
 
 # ============================================================
 # GERADOS — reconstruíveis

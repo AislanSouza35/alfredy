@@ -24,7 +24,10 @@ CONFIANCA_ALTA_SEM_REFINAMENTO = 0.94
 # em proporção da largura/altura da captura original.
 PROPORCAO_RECORTE = 0.22
 # Tentativas ao encontrar erros temporários da API (ex.: 503 alta demanda).
-TENTATIVAS_GEMINI = 3
+# Três tentativas com 1,5 s e 3 s de espera não passavam de um pico de
+# demanda: no ensaio de 10/09 cinco de sete buscas morreram em 503. A
+# espera agora dobra a cada tentativa (1,5 / 3 / 6 / 12 s).
+TENTATIVAS_GEMINI = 5
 ESPERA_ENTRE_TENTATIVAS = 1.5
 TERMOS_BLOQUEADOS = (
     "excluir",
@@ -140,7 +143,7 @@ def _perguntar_coordenada(cliente, imagem_bytes, alvo):
         except Exception as erro:
             ultimo_erro = erro
             if tentativa < TENTATIVAS_GEMINI - 1:
-                time.sleep(ESPERA_ENTRE_TENTATIVAS * (tentativa + 1))
+                time.sleep(ESPERA_ENTRE_TENTATIVAS * (2 ** tentativa))
 
     raise ultimo_erro
 

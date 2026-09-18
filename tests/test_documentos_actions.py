@@ -467,3 +467,62 @@ def test_ferramenta_registrada(ferramenta):
 def test_instrucao_avisa_que_material_e_base_nao_final():
     assert "base para o professor ajustar" in CODIGO_CLIENTE
     assert "Nunca leia o conteúdo inteiro em voz alta" in CODIGO_CLIENTE
+
+
+# ============================================================
+# Escala das notas sugeridas
+# ============================================================
+
+def test_planilha_de_correcao_recusa_nota_acima_do_valor(monkeypatch):
+    """
+    Caso real: atividade de 1 ponto e notas sugeridas em escala de 10.
+    Montar a planilha assim daria 21 linhas para o professor reescrever,
+    e o transporte digitaria 8 num campo que vai até 1.
+    """
+
+    import actions.classroom_actions as ca
+
+    monkeypatch.setattr(
+        ca,
+        "_encontrar_turma",
+        lambda turma: (
+            ("prof@escola.com", object(), None, {"id": "t1", "name": "3A"}, ""),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        ca,
+        "_encontrar_atividade",
+        lambda servico, id_turma, nome: (
+            {"id": "a1", "title": "Fluxograma", "maxPoints": 1},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        ca, "_mapa_de_alunos", lambda servico, id_turma: ({"u1": "Ana"}, None)
+    )
+    monkeypatch.setattr(ca, "_executar", lambda pedido: ({}, None))
+
+    resultado = doc.montar_planilha_de_correcao(
+        "3A",
+        "Fluxograma",
+        [
+            {"aluno": "Ana", "nota": "8", "comentario": "boa"},
+        ],
+    )
+
+    assert "vale 1" in resultado
+    assert "Ana com 8" in resultado
+    assert "Não montei a planilha" in resultado
+
+
+def test_instrucao_pede_comentario_humano():
+    """
+    As observações saíam como laudo: "Fluxograma apresentado, mas faltou
+    detalhar infraestrutura." O aluno pode ler isso.
+    """
+
+    assert "Comece pelo que ele acertou" in CODIGO_CLIENTE
+    assert "Elogio genérico não ensina nada" in CODIGO_CLIENTE
+    # Sem entrega não existe acerto para elogiar.
+    assert "NÃO invente elogio" in CODIGO_CLIENTE

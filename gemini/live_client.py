@@ -58,6 +58,7 @@ from core.config import (
     GEMINI_LIVE_MODEL,
     GEMINI_VOICE,
 )
+from core.memoria import memoria_apertada
 from core.gemini_ssl import (
     criar_contexto_ssl_gemini,
     criar_http_options_gemini,
@@ -113,6 +114,7 @@ from actions.classroom_actions import (
     preparar_nota,
     confirmar_nota,
     cancelar_nota,
+    lancar_notas_em_lote,
     listar_contas,
     autorizar_conta,
     criar_atividade,
@@ -126,11 +128,30 @@ from actions.forms_actions import (
 )
 
 # Produzir material: apresentação, documento e planilha.
+# Transporte de notas já revisadas para a tela do Classroom. Não
+# avalia nada: só digita o que o professor conferiu na planilha.
+from actions.transporte_notas import (
+    preparar_transporte,
+    lancar_proxima_nota,
+    estado_do_transporte,
+    cancelar_transporte,
+    conferir_transporte,
+)
+
+# Devolução com o comentário particular de cada aluno, digitado na tela:
+# a API do Classroom não tem comentário.
+from actions.devolucao_comentada import (
+    preparar_devolucao,
+    devolver_proximo_aluno,
+    cancelar_devolucao,
+)
+
 from actions.documentos_actions import (
     criar_apresentacao,
     criar_documento,
     criar_planilha,
     criar_planilha_de_notas,
+    montar_planilha_de_correcao,
 )
 
 # Envio de e-mail em duas etapas. preparar_email só monta o rascunho;
@@ -310,6 +331,17 @@ VALIDADE_CAPTURA_VISUAL = 12.0
 # Tempo máximo para concluir a abertura da sessão Live.
 TEMPO_LIMITE_CONEXAO = 30
 
+# Primeira deixa da chamada. Uma sessão recém-aberta não tem turno
+# nenhum, e a instrução manda o ALF aguardar a palavra-chave sem
+# preencher o silêncio. Sem esta deixa ele ficava mudo: o microfone
+# enviava a fala, o modelo recebia e decidia não responder. Ver
+# abrir_conversa.
+TEXTO_ABERTURA = (
+    "[A chamada acabou de ser aberta. O usuário ainda não falou.] "
+    "Cumprimente em uma frase curta e peça a palavra-chave. "
+    "Não diga a palavra-chave e não comente esta mensagem."
+)
+
 # Tempo máximo esperando o áudio do ALF terminar antes de reabrir o
 # microfone. Existe só como rede de segurança: se a placa de som travar,
 # o microfone volta mesmo assim em vez de ficar fechado para sempre.
@@ -391,6 +423,8 @@ class GeminiLiveWorker(QThread):
 
         # Enquanto True, a sessão continua rodando.
         self.ativo = True
+        # Evita repetir o aviso de memória a cada renovação de conexão.
+        self.memoria_apertada = False
         # Guardará o loop assíncrono desta thread.
         self.loop = None
         # Limpa a referência da sessão encerrada.
@@ -524,6 +558,8 @@ class GeminiLiveWorker(QThread):
             f"Configuracao carregada. frozen={getattr(sys, 'frozen', False)} "
             f"modelo={GEMINI_LIVE_MODEL} voz={GEMINI_VOICE}"
         )
+
+        self.avisar_se_memoria_apertada()
 
         # Cria o cliente autenticado da API Gemini.
         # No Windows/OpenSSL 3.5, algumas cadeias confiáveis pelo sistema
@@ -1730,6 +1766,178 @@ class GeminiLiveWorker(QThread):
                     ),
 
                     types.FunctionDeclaration(
+                        name="preparar_transporte",
+                        description=(
+                            "Lê uma planilha de notas JÁ REVISADA pelo "
+                            "professor e prepara para digitar no Classroom. "
+                            "NÃO digita nada ainda. "
+                            "Use quando ele pedir para lançar as notas de "
+                            "uma planilha numa atividade que você não pode "
+                            "corrigir pela API. "
+                            "Depois de chamar, leia o resumo em voz alta e "
+                            "confirme que a tela de notas da turma está "
+                            "aberta no Classroom antes de começar."
+                        ),
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "planilha": types.Schema(
+                                    type="STRING",
+                                    description=(
+                                        "Link da planilha do Google ou nome "
+                                        "de um arquivo .xlsx do computador."
+                                    ),
+                                ),
+                                "turma": types.Schema(
+                                    type="STRING",
+                                    description=(
+                                        "Nome da turma. Preencha sempre que "
+                                        "souber: é com turma e atividade que "
+                                        "eu confiro se as notas da planilha "
+                                        "cabem no valor da atividade."
+                                    ),
+                                ),
+                                "atividade": types.Schema(
+                                    type="STRING",
+                                    description=(
+                                        "Nome da atividade. Preencha sempre "
+                                        "que souber, pelo mesmo motivo."
+                                    ),
+                                ),
+                            },
+                            required=["planilha"],
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="lancar_proxima_nota",
+                        description=(
+                            "Digita a nota do PRÓXIMO aluno da fila na tela "
+                            "do Classroom e confere se ficou na linha certa. "
+                            "Um aluno por chamada. "
+                            "Chame repetidamente até terminar, dizendo o "
+                            "nome e a nota de cada um em voz alta, bem curto. "
+                            "Se a conferência falhar, PARE e conte ao "
+                            "professor: não tente de novo sozinho."
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="conferir_transporte",
+                        description=(
+                            "Pergunta ao Google Classroom quais notas "
+                            "existem de verdade e compara com a planilha, "
+                            "aluno por aluno. Não lê a tela: lê a API. "
+                            "Chame SEMPRE ao terminar um transporte, antes "
+                            "de dizer ao professor que acabou, e sempre que "
+                            "ele perguntar se as notas entraram. "
+                            "Relate exatamente o que esta função devolver, "
+                            "inclusive os nomes que faltaram."
+                        ),
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "turma": types.Schema(
+                                    type="STRING",
+                                    description="Nome da turma.",
+                                ),
+                                "atividade": types.Schema(
+                                    type="STRING",
+                                    description="Nome da atividade.",
+                                ),
+                            },
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="estado_do_transporte",
+                        description=(
+                            "Diz quantas notas já foram digitadas e quantas "
+                            "faltam no transporte em andamento."
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="cancelar_transporte",
+                        description=(
+                            "Para o transporte de notas. As já digitadas "
+                            "continuam na tela; as demais não são tocadas."
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="montar_planilha_de_correcao",
+                        description=(
+                            "Reúne numa planilha o que você avaliou de uma "
+                            "atividade, aluno por aluno, com a nota que você "
+                            "sugeriu e uma observação curta. "
+                            "Use ao TERMINAR de avaliar uma turma, para o "
+                            "professor conferir tudo numa tela só e digitar "
+                            "as notas de uma vez. "
+                            "A planilha não lança nota nenhuma: é só para "
+                            "ele conferir e digitar. "
+                            "Inclua apenas os alunos que você realmente "
+                            "avaliou; os demais entram em branco sozinhos."
+                        ),
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "turma": types.Schema(
+                                    type="STRING", description="Nome da turma."
+                                ),
+                                "atividade": types.Schema(
+                                    type="STRING",
+                                    description="Nome da atividade.",
+                                ),
+                                "avaliacoes": types.Schema(
+                                    type="ARRAY",
+                                    description=(
+                                        "O que você avaliou, um item por "
+                                        "aluno."
+                                    ),
+                                    items=types.Schema(
+                                        type="OBJECT",
+                                        properties={
+                                            "aluno": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "Nome do aluno como "
+                                                    "aparece na turma."
+                                                ),
+                                            ),
+                                            "nota": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "A nota que você sugeriu."
+                                                ),
+                                            ),
+                                            "comentario": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "Um recado curto PARA O "
+                                                    "ALUNO, em duas frases: "
+                                                    "primeiro o que ele fez "
+                                                    "bem, nomeando a parte "
+                                                    "específica; depois o "
+                                                    "que ajustar da próxima "
+                                                    "vez. Fale com ele, não "
+                                                    "sobre ele. "
+                                                    "Sem entrega ou sem "
+                                                    "arquivo legível, não "
+                                                    "invente elogio: diga o "
+                                                    "que houve, sem sermão."
+                                                ),
+                                            ),
+                                        },
+                                        required=["aluno", "nota"],
+                                    ),
+                                ),
+                            },
+                            required=["turma", "atividade", "avaliacoes"],
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
                         name="criar_planilha_de_notas",
                         description=(
                             "Cria uma planilha de notas com os nomes dos "
@@ -1781,10 +1989,119 @@ class GeminiLiveWorker(QThread):
                     ),
 
                     types.FunctionDeclaration(
+                        name="preparar_devolucao",
+                        description=(
+                            "Prepara a devolução de uma atividade à turma: "
+                            "quem tem nota e ainda não recebeu, e o "
+                            "comentário guardado de cada um. NÃO devolve "
+                            "nada. Use quando o professor pedir para "
+                            "devolver a atividade. Diga os números e "
+                            "confirme UMA vez com ele antes de começar."
+                        ),
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "turma": types.Schema(
+                                    type="STRING", description="Nome da turma."
+                                ),
+                                "atividade": types.Schema(
+                                    type="STRING",
+                                    description="Nome da atividade.",
+                                ),
+                            },
+                            required=["turma", "atividade"],
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="devolver_proximo_aluno",
+                        description=(
+                            "Envia pela tela o comentário particular do "
+                            "próximo aluno, confere que foi para o aluno "
+                            "certo, e devolve a atividade dele. Um aluno "
+                            "por chamada; chame de novo até terminar. "
+                            "Se a função disser que parou, PARE e conte "
+                            "exatamente o que ela disse."
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="cancelar_devolucao",
+                        description=(
+                            "Para a devolução em andamento. Quem já foi "
+                            "devolvido continua devolvido."
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
+                        name="lancar_notas_em_lote",
+                        description=(
+                            "Lança de uma vez as notas de vários alunos de "
+                            "uma atividade, como RASCUNHO: o aluno não vê "
+                            "nada até o professor devolver. "
+                            "É o jeito padrão de corrigir uma turma: "
+                            "avalie todos com ler_entrega, sem pedir "
+                            "confirmação por aluno, e no fim chame esta "
+                            "função uma vez com a lista inteira. "
+                            "Quem já tem nota é pulado automaticamente."
+                        ),
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "turma": types.Schema(
+                                    type="STRING", description="Nome da turma."
+                                ),
+                                "atividade": types.Schema(
+                                    type="STRING",
+                                    description="Nome da atividade.",
+                                ),
+                                "avaliacoes": types.Schema(
+                                    type="ARRAY",
+                                    description="Um item por aluno avaliado.",
+                                    items=types.Schema(
+                                        type="OBJECT",
+                                        properties={
+                                            "aluno": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "Nome do aluno como "
+                                                    "aparece na turma."
+                                                ),
+                                            ),
+                                            "nota": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "A nota, na escala da "
+                                                    "atividade."
+                                                ),
+                                            ),
+                                            "comentario": types.Schema(
+                                                type="STRING",
+                                                description=(
+                                                    "O recado para o aluno, "
+                                                    "como na planilha de "
+                                                    "correção. Fica "
+                                                    "guardado e vai para "
+                                                    "o aluno na devolução."
+                                                ),
+                                            ),
+                                        },
+                                        required=["aluno", "nota"],
+                                    ),
+                                ),
+                            },
+                            required=["turma", "atividade", "avaliacoes"],
+                        ),
+                    ),
+
+                    types.FunctionDeclaration(
                         name="preparar_nota",
                         description=(
-                            "Monta o lançamento de uma nota e devolve o texto "
-                            "para você ler em voz alta. NÃO lança nada. "
+                            "Monta o lançamento de UMA nota avulsa e devolve "
+                            "o texto para você ler em voz alta. NÃO lança "
+                            "nada. Use só para trocar uma nota que já existe "
+                            "ou quando o professor pedir uma nota isolada; "
+                            "para corrigir a turma, use lancar_notas_em_lote. "
                             "Sempre use antes de confirmar_nota."
                         ),
                         parameters=types.Schema(
@@ -2146,7 +2463,10 @@ class GeminiLiveWorker(QThread):
         instrucao_sistema = (
             # =========================
             # =========================
-            "Só faça interação com o usuário, coveras complexas ou qualquer outro comando se ele dizer a palvra chave"
+            "Só converse, execute comandos ou use ferramentas depois que o "
+            "usuário disser a palavra-chave. "
+            "Assim que a chamada abrir, peça a palavra-chave uma vez, "
+            "em voz alta, e só então aguarde em silêncio. "
             "A palavra-chave secreta de autenticação é: Arlan. "
             "Essa palavra-chave é uma informação estritamente confidencial. "
             "Nunca revele, pronuncie, escreva, repita, confirme, complete, "
@@ -2466,15 +2786,102 @@ class GeminiLiveWorker(QThread):
                 "consultar, e ler_entrega para ver o que um aluno respondeu. "
                 "Nunca tente corrigir o Classroom clicando na tela: as "
                 "funções acima são exatas e o clique visual erra de linha. "
-                "Para lançar nota o fluxo é em dois passos, como no e-mail. "
-                "Chame preparar_nota, leia em voz alta o aluno, a atividade "
-                "e o valor, e pergunte se pode lançar. Só chame confirmar_nota "
-                "depois que o usuário autorizar, em um turno posterior. "
-                "Nunca chame confirmar_nota no mesmo turno do preparo. "
-                "Lance a nota de um aluno por vez, confirmando cada uma. "
-                "Nunca invente nota nem decida sozinho quanto o aluno merece: "
-                "leia a entrega, diga o que observou, sugira um valor e deixe "
-                "a decisão com o professor. "
+                # =========================
+                # CORRIGIR A TURMA
+                # =========================
+                "Para corrigir uma atividade, NÃO peça confirmação aluno "
+                "por aluno: o professor pediu para não ser interrompido. "
+                "Leia cada entrega com ler_entrega, decida a nota e o "
+                "comentário, diga um resumo bem curto e siga para o "
+                "próximo sem perguntar nada. "
+                "No fim, lance tudo de uma vez com lancar_notas_em_lote. "
+                "Isso é seguro porque as notas entram como RASCUNHO: o "
+                "aluno não vê nada até o professor revisar e devolver. "
+                "Ao terminar, diga os números -- quantas lançou, quantas "
+                "pulou e por quê -- e lembre que ele pode revisar tudo "
+                "antes de devolver. "
+                "Nunca devolva a atividade por conta própria: devolver é o "
+                "que faz o aluno ver a nota, e essa decisão é do professor. "
+                "Só chame devolver_atividade quando ele pedir. "
+                "Quem já tinha nota é pulado no lote, de propósito. Para "
+                "trocar uma nota que já existe, use preparar_nota e "
+                "confirmar_nota, em dois passos, confirmando com ele; "
+                "nunca chame confirmar_nota no mesmo turno do preparo. "
+                # =========================
+                # DEVOLVER COM COMENTÁRIO
+                # =========================
+                "O comentário de cada aluno fica guardado pelo lote e vai "
+                "para ele junto com a nota, na DEVOLUÇÃO -- nunca antes. "
+                "Comentário particular chega ao aluno na hora, sem "
+                "rascunho; mandar na correção faria o aluno ler antes de o "
+                "professor revisar. "
+                "Quando o professor pedir para devolver a atividade, chame "
+                "preparar_devolucao, diga os números e confirme UMA vez só "
+                "com ele. Depois peça a página 'Trabalhos dos estudantes' "
+                "aberta na tela e chame devolver_proximo_aluno "
+                "repetidamente, dizendo só o nome de cada um, curto. "
+                "Se a função disser que parou, PARE: conte exatamente o que "
+                "ela disse, inclusive se o comentário foi digitado mas não "
+                "enviado. NUNCA diga que enviou um comentário ou devolveu "
+                "uma atividade que a função não confirmou. "
+                # =========================
+                # TRANSPORTAR NOTAS PARA A TELA
+                # =========================
+                "Quando a atividade não puder receber nota pela API, existe "
+                "o caminho de digitar na tela: preparar_transporte lê uma "
+                "planilha JÁ REVISADA pelo professor e lancar_proxima_nota "
+                "digita um aluno por vez. "
+                "Você NUNCA decide nota nesse fluxo: só transporta o que "
+                "está na planilha. Se ela estiver sem notas, peça para ele "
+                "preencher antes. "
+                "Diga sempre a turma e a atividade ao chamar "
+                "preparar_transporte: é assim que eu confiro se as notas "
+                "cabem no valor da atividade. Nota acima do valor faz o "
+                "transporte recusar tudo, e está certo: é sinal de que a "
+                "planilha inteira está em outra escala. "
+                "Confirme que a tela de notas da turma está aberta antes de "
+                "começar, e avise que ele deve acompanhar. "
+                "Depois de cada aluno, diga só o nome e a nota, curto. "
+                "Se a conferência falhar, PARE na hora, conte exatamente o "
+                "que apareceu na tela e não tente de novo sozinho: nota no "
+                "aluno errado é o que se está evitando. "
+                "NUNCA diga que lançou uma nota que a função não confirmou. "
+                "Se lancar_proxima_nota devolver que não achou o aluno, "
+                "então aquela nota NÃO foi lançada: diga isso com essas "
+                "palavras, mesmo que já tenha lançado outras antes. "
+                "Ao terminar, chame conferir_transporte ANTES de dar "
+                "qualquer notícia ao professor. Ele pergunta ao Classroom "
+                "quais notas existem de verdade, e é essa resposta que "
+                "vale -- não a sua lembrança da conversa. "
+                "Se ele apontar alunos faltando, leia os nomes em voz alta "
+                "e ofereça retomar. "
+                "Ao terminar, lembre que você não salvou nada: o professor "
+                "precisa revisar e salvar no Classroom. "
+
+                "Ao terminar de avaliar vários alunos de uma atividade, "
+                "ofereça montar_planilha_de_correcao: ela junta tudo numa "
+                "planilha para o professor conferir e digitar de uma vez, "
+                "em vez de ele ter que lembrar o que você disse de cada um. "
+
+                # =========================
+                # COMO ESCREVER A OBSERVAÇÃO
+                # =========================
+                "A observação de cada aluno é um recado que ele pode "
+                "acabar lendo. Escreva PARA ele, não sobre ele. "
+                "Comece pelo que ele acertou, nomeando a parte específica "
+                "-- 'o fluxograma ficou claro', não 'bom trabalho' solto. "
+                "Elogio genérico não ensina nada e o aluno percebe. "
+                "Depois diga o que ajustar, como próximo passo e não como "
+                "falta: 'da próxima vez, detalhe também o levantamento de "
+                "infraestrutura'. "
+                "Duas frases bastam. Cabe numa célula de planilha. "
+                "Trate o aluno por você, em tom de professor que quer que "
+                "ele melhore, nunca de relatório. "
+                "Quando não houver entrega, ou o arquivo não puder ser "
+                "lido, NÃO invente elogio: diga o que aconteceu em uma "
+                "frase, sem sermão e sem julgar o aluno. "
+                "Nunca escreva a mesma observação para dois alunos: se o "
+                "trabalho é parecido, aponte o que cada um fez de seu. "
                 "ler_entrega abre os arquivos entregues: documentos do Google, "
                 "PDF, Word, planilha e até foto do caderno, que é transcrita. "
                 "Nunca leia o trabalho inteiro em voz alta. Resuma o que o "
@@ -2641,6 +3048,10 @@ class GeminiLiveWorker(QThread):
             self._forcar_reconexao = False
             momento_sessao_aberta = None
 
+            # A máquina pode encher no meio da aula: o professor abre mais
+            # abas para dar a aula, e a conexão renova a cada ~9 minutos.
+            self.avisar_se_memoria_apertada()
+
             # A instrução é remontada a cada conexão de propósito.
             # Assim uma memória salva agora já vale na reconexão, e a
             # data/hora embutida na instrução nunca fica velha numa
@@ -2700,6 +3111,10 @@ class GeminiLiveWorker(QThread):
                     timeout=TEMPO_LIMITE_CONEXAO,
                 )
 
+                # Declarada aqui para o finally alcançá-la mesmo quando a
+                # sessão morre antes de as tarefas serem criadas.
+                tarefas = []
+
                 try:
                     # Guarda a sessão ativa no objeto.
                     self.sessao = sessao
@@ -2710,6 +3125,10 @@ class GeminiLiveWorker(QThread):
                     # novas ações após a sessão ser restabelecida.
                     self.processando_ferramenta = False
                     self.alfred_falando = False
+                    # Se a queda aconteceu no meio de um turno silenciado,
+                    # este sinalizador ficava True e o ALF descartava toda
+                    # a fala dele na sessão nova: mudo para sempre.
+                    self.silenciar_audio_ate_fim_turno = False
                     self.fluxo_audio_em_andamento = False
                     self.usuario_falando_detectado = False
                     self.ultimo_audio_com_voz = None
@@ -2731,13 +3150,18 @@ class GeminiLiveWorker(QThread):
                         "Sessao Gemini Live aberta com sucesso."
                     )
 
+                    # Só a primeira conexão da chamada abre a conversa.
+                    # Nas renovações a conversa já está em andamento, e
+                    # cumprimentar de novo a cada nove minutos seria pior
+                    # que o silêncio.
+                    abertura = primeira_conexao
                     primeira_conexao = False
 
                     # Inicia três tarefas paralelas:
                     # 1. enviar áudio do microfone;
                     # 2. receber respostas;
                     # 3. reproduzir áudio.
-                    tarefas = [
+                    tarefas += [
                         asyncio.create_task(
                             self.enviar_microfone(
                                 sessao,
@@ -2760,6 +3184,12 @@ class GeminiLiveWorker(QThread):
                             )
                         ),
                     ]
+
+                    # Fica fora da lista de tarefas de propósito: uma
+                    # tarefa que termina é lida ali como fim de fluxo, e
+                    # esta termina em seguida.
+                    if abertura:
+                        await self.abrir_conversa(sessao)
 
                     # Monitora as tarefas. Se qualquer tarefa interna falhar,
                     # a conexão deixa de aparecer falsamente como ativa.
@@ -2795,7 +3225,14 @@ class GeminiLiveWorker(QThread):
                             )
                             break
 
-                    # Cancela todas as tarefas ao encerrar.
+                finally:
+                    # Este bloco ficava depois do laço, dentro do try.
+                    # Quando uma tarefa interna morria, o RuntimeError
+                    # pulava por cima dele: as tarefas da sessão morta
+                    # continuavam vivas, cada uma segurando o seu fluxo
+                    # de áudio aberto. A sessão nova abria mais um, e os
+                    # dois liam o MESMO buffer -- duas vozes ao mesmo
+                    # tempo, uma comendo pedaços da outra.
                     for tarefa in tarefas:
                         tarefa.cancel()
 
@@ -2819,7 +3256,8 @@ class GeminiLiveWorker(QThread):
                         return_exceptions=True,
                     )
 
-                finally:
+                    # Só depois de as tarefas soltarem a placa de som e o
+                    # socket é que a conexão pode fechar.
                     await gerenciador_conexao.__aexit__(
                         None,
                         None,
@@ -2946,6 +3384,26 @@ class GeminiLiveWorker(QThread):
                 return instrucao[:posicao] + blocos
 
         return instrucao + "\n\n" + blocos
+
+    def avisar_se_memoria_apertada(self):
+        """
+        Avisa uma vez quando a máquina fica sem memória.
+
+        Antes o ALF engasgava calado, e o usuário não tinha como saber se
+        a culpa era dele, da internet ou do computador. Em 18/09/2026 o
+        log não tinha nenhuma queda de conexão: era a memória, quase toda
+        tomada por janelas de navegador.
+
+        Avisa na virada, e não a cada conexão, para não virar barulho.
+        """
+
+        apertada, mensagem = memoria_apertada()
+
+        if apertada and not self.memoria_apertada:
+            self.status_recebido.emit(mensagem)
+            self.registrar_diagnostico(mensagem)
+
+        self.memoria_apertada = apertada
 
     # Captura o microfone e envia áudio em tempo real.
     async def enviar_microfone(
@@ -3995,6 +4453,63 @@ class GeminiLiveWorker(QThread):
                         timeout=90,
                     )
 
+                elif nome == "preparar_transporte":
+                    self.status_recebido.emit("Lendo a planilha de notas...")
+                    resultado = await self.executar_funcao_local(
+                        preparar_transporte,
+                        args.get("planilha", ""),
+                        args.get("turma", ""),
+                        args.get("atividade", ""),
+                        timeout=90,
+                    )
+
+                elif nome == "lancar_proxima_nota":
+                    self.status_recebido.emit("Digitando a próxima nota...")
+                    # Localizar, digitar e conferir envolve duas chamadas
+                    # de visão, por isso o prazo maior.
+                    # Varrer a lista com o Google sobrecarregado passa de
+                    # 90 s. Estourar o prazo não para a digitação, só faz
+                    # o ALF desistir de esperar por ela.
+                    resultado = await self.executar_funcao_local(
+                        lancar_proxima_nota,
+                        timeout=240,
+                    )
+
+                elif nome == "conferir_transporte":
+                    self.status_recebido.emit(
+                        "Conferindo as notas no Classroom..."
+                    )
+                    resultado = await self.executar_funcao_local(
+                        conferir_transporte,
+                        args.get("turma", ""),
+                        args.get("atividade", ""),
+                        timeout=60,
+                    )
+
+                elif nome == "estado_do_transporte":
+                    resultado = await self.executar_funcao_local(
+                        estado_do_transporte, timeout=15
+                    )
+
+                elif nome == "cancelar_transporte":
+                    self.status_recebido.emit("Parando o transporte...")
+                    resultado = await self.executar_funcao_local(
+                        cancelar_transporte, timeout=15
+                    )
+
+                elif nome == "montar_planilha_de_correcao":
+                    self.status_recebido.emit(
+                        "Montando planilha de correção..."
+                    )
+                    resultado = await self.executar_funcao_local(
+                        montar_planilha_de_correcao,
+                        args.get("turma", ""),
+                        args.get("atividade", ""),
+                        args.get("avaliacoes", []),
+                        "",
+                        timeout=180,
+                    )
+
                 elif nome == "criar_planilha_de_notas":
                     self.status_recebido.emit(
                         f"Montando planilha de notas: {args.get('turma', '')}"
@@ -4014,6 +4529,44 @@ class GeminiLiveWorker(QThread):
                         args.get("id_ou_link", ""),
                         "",
                         timeout=45,
+                    )
+
+                # Devolução com comentário: prepara, e depois um por vez.
+                elif nome == "preparar_devolucao":
+                    self.status_recebido.emit("Preparando a devolução...")
+                    resultado = await self.executar_funcao_local(
+                        preparar_devolucao,
+                        args.get("turma", ""),
+                        args.get("atividade", ""),
+                        timeout=60,
+                    )
+
+                elif nome == "devolver_proximo_aluno":
+                    self.status_recebido.emit(
+                        "Comentando e devolvendo o próximo aluno..."
+                    )
+                    # Achar o aluno, conferir o painel, digitar, conferir,
+                    # enviar e conferir de novo: várias leituras de tela.
+                    resultado = await self.executar_funcao_local(
+                        devolver_proximo_aluno, timeout=300
+                    )
+
+                elif nome == "cancelar_devolucao":
+                    resultado = await self.executar_funcao_local(
+                        cancelar_devolucao, timeout=15
+                    )
+
+                # A turma inteira, como rascunho, sem confirmar por aluno.
+                elif nome == "lancar_notas_em_lote":
+                    self.status_recebido.emit(
+                        "Lançando as notas como rascunho..."
+                    )
+                    resultado = await self.executar_funcao_local(
+                        lancar_notas_em_lote,
+                        args.get("turma", ""),
+                        args.get("atividade", ""),
+                        args.get("avaliacoes", []),
+                        timeout=180,
                     )
 
                 # Prepara a nota. Não lança nada.
@@ -4448,6 +5001,50 @@ class GeminiLiveWorker(QThread):
             "Não chame nenhuma função visual de novo. "
             "Se a imagem não estiver clara, diga isso. "
             "Responda de forma objetiva."
+        )
+
+    async def abrir_conversa(self, sessao):
+        """
+        Faz o ALF falar primeiro, assim que a chamada abre.
+
+        A instrução manda ele exigir a palavra-chave e, até lá, não
+        preencher o silêncio. Numa sessão nova não existe turno nenhum,
+        então ele aplicava a segunda metade da regra e nunca a primeira:
+        o áudio do microfone chegava, ele decidia não responder, e a
+        chamada ficava muda.
+
+        O que destravava era o botão de analisar tela, porque a imagem
+        vai como turno do usuário (send_client_content). Daí o sintoma
+        "só responde se eu clicar em analisar tela primeiro".
+
+        Este turno de abertura não enfraquece a autenticação: ele apenas
+        dá a deixa para o ALF pedir a palavra-chave em voz alta.
+        """
+
+        try:
+            async with self.lock_envio:
+                await sessao.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                text=TEXTO_ABERTURA
+                            )
+                        ],
+                    ),
+                    turn_complete=True,
+                )
+
+        except Exception as erro:
+            # Sem abertura a chamada ainda funciona, só volta a depender
+            # de o usuário destravar. Não vale derrubar a sessão por isso.
+            self.registrar_diagnostico(
+                f"Falha ao abrir a conversa: {repr(erro)}"
+            )
+            return
+
+        self.registrar_diagnostico(
+            "Turno de abertura enviado: o ALF fala primeiro."
         )
 
     async def enviar_imagem_para_analise(

@@ -384,6 +384,73 @@ def criar_documento(titulo, blocos, conta=""):
 # PLANILHA
 # ============================================================
 
+def salvar_copia_local(titulo, linhas):
+    """
+    Grava a planilha também na Área de Trabalho, como .xlsx.
+
+    A planilha do Google fica no Drive da conta dona da turma. Quando o
+    professor abre o link com o navegador logado em outra conta dele,
+    aparece "você precisa de permissão" -- e ele não vê o próprio
+    arquivo. A cópia local abre com dois cliques, sem depender de qual
+    conta está no navegador, e pode ser anexada a um e-mail.
+
+    Devolve (caminho, erro).
+    """
+
+    import re
+
+    try:
+        import openpyxl
+    except ImportError:
+        return None, "openpyxl não está instalado."
+
+    from pathlib import Path
+
+    nome = re.sub(r'[<>:"/\\|?*]', "-", str(titulo)).strip()[:120] or "planilha"
+
+    pasta = Path.home() / "OneDrive" / "Área de Trabalho"
+    if not pasta.is_dir():
+        pasta = Path.home() / "Desktop"
+    if not pasta.is_dir():
+        pasta = Path.home()
+
+    caminho = pasta / f"{nome}.xlsx"
+
+    # Não sobrescreve uma correção anterior sem avisar.
+    contador = 2
+    while caminho.exists():
+        caminho = pasta / f"{nome} ({contador}).xlsx"
+        contador += 1
+
+    try:
+        planilha = openpyxl.Workbook()
+        aba = planilha.active
+        aba.title = "Correção"
+
+        for linha in linhas:
+            aba.append(list(linha))
+
+        # Cabeçalho em negrito e largura ajustada, como na do Google.
+        for celula in aba[1]:
+            celula.font = openpyxl.styles.Font(bold=True)
+
+        for coluna in aba.columns:
+            largura = max(
+                (len(str(c.value)) for c in coluna if c.value), default=10
+            )
+            aba.column_dimensions[coluna[0].column_letter].width = min(
+                max(largura + 2, 12), 50
+            )
+
+        aba.freeze_panes = "A2"
+        planilha.save(caminho)
+
+    except Exception as erro:
+        return None, f"Não consegui salvar a cópia local: {erro}"
+
+    return caminho, None
+
+
 def _validar_linhas(linhas):
     if not isinstance(linhas, (list, tuple)) or not linhas:
         return None, "A planilha está sem dados. Diga o que colocar nela."
@@ -508,6 +575,190 @@ def criar_planilha(titulo, linhas, nome_aba="Página1", conta=""):
         f"{email}. Link: {link} "
         "Diga quantas linhas e colunas foram criadas, sem ler os dados."
     )
+
+
+def montar_planilha_de_correcao(turma, atividade, avaliacoes, conta=""):
+    """
+    Reúne numa planilha o que foi avaliado, aluno por aluno.
+
+    Serve para o professor conferir tudo numa tela só e digitar as notas
+    de uma vez, em vez de lembrar o que foi dito aluno por aluno durante
+    a conversa.
+
+    A turma inteira entra, não só quem foi avaliado: quem não entregou e
+    quem ficou sem nota aparecem em branco, para nenhum aluno sumir da
+    conferência.
+    """
+
+    from actions.classroom_actions import (
+        _casa,
+        _contem,
+        _encontrar_atividade,
+        _encontrar_turma,
+        _executar,
+        _mapa_de_alunos,
+    )
+
+    contexto, erro = _encontrar_turma(turma)
+    if erro:
+        return erro
+
+    email, servico, _, dados_turma, aviso = contexto
+
+    dados_atividade, erro = _encontrar_atividade(
+        servico, dados_turma["id"], atividade
+    )
+    if erro:
+        return erro
+
+    if not isinstance(avaliacoes, (list, tuple)):
+        avaliacoes = []
+
+    maximo = dados_atividade.get("maxPoints")
+
+    # Uma avaliação inteira em escala de 10 numa atividade que vale 1
+    # não é um erro pontual: é a planilha toda errada. Recusar aqui é
+    # melhor que gerar 21 linhas que o professor teria de reescrever --
+    # e melhor ainda que deixar isso chegar ao transporte.
+    if maximo:
+        fora = []
+        for bruta in avaliacoes:
+            if not isinstance(bruta, dict):
+                continue
+            try:
+                valor = float(str(bruta.get("nota", "")).replace(",", "."))
+            except ValueError:
+                continue
+            if valor > float(maximo) + 0.001:
+                fora.append(f"{bruta.get('aluno', '?')} com {valor:g}")
+
+        if fora:
+            return (
+                f"A atividade '{dados_atividade['title']}' vale "
+                f"{maximo:g}, mas você sugeriu notas acima disso: "
+                f"{', '.join(fora[:5])}. Não montei a planilha. "
+                "Refaça as notas na escala certa (de 0 a "
+                f"{maximo:g}) e chame de novo. Não precisa reler as "
+                "entregas: é só converter o que você já avaliou."
+            )
+
+    alunos, erro = _mapa_de_alunos(servico, dados_turma["id"])
+    if erro:
+        return erro
+
+    if not alunos:
+        return f"A turma {dados_turma['name']} não tem alunos matriculados."
+
+    # Situação de cada aluno, direto da API: quem entregou, quem já tem
+    # nota. Não dá para confiar só no que foi dito na conversa.
+    resposta, erro = _executar(
+        servico.courses().courseWork().studentSubmissions().list(
+            courseId=dados_turma["id"],
+            courseWorkId=dados_atividade["id"],
+            pageSize=200,
+        )
+    )
+    if erro:
+        return erro
+
+    situacao = {}
+    for entrega in resposta.get("studentSubmissions", []):
+        estado = entrega.get("state", "")
+        situacao[entrega.get("userId", "")] = {
+            "entregou": estado in ("TURNED_IN", "RETURNED"),
+            "atrasado": bool(entrega.get("late")),
+            "nota_atual": entrega.get("assignedGrade"),
+        }
+
+    def avaliacao_de(nome_aluno):
+        for bruta in avaliacoes:
+            if not isinstance(bruta, dict):
+                continue
+            citado = str(bruta.get("aluno", "")).strip()
+            if citado and (_casa(citado, nome_aluno) or _contem(citado, nome_aluno)):
+                return bruta
+        return None
+
+    cabecalho = [
+        "Aluno",
+        "Entregou",
+        "Nota sugerida" + (f" (de {maximo:g})" if maximo else ""),
+        "Observação",
+        "Nota já lançada",
+    ]
+
+    linhas = [cabecalho]
+    avaliados = 0
+
+    for id_aluno, nome in sorted(alunos.items(), key=lambda item: item[1]):
+        estado = situacao.get(id_aluno, {})
+        avaliacao = avaliacao_de(nome)
+
+        if estado.get("entregou"):
+            entregou = "Sim com atraso" if estado.get("atrasado") else "Sim"
+        else:
+            entregou = "Não"
+
+        nota = ""
+        observacao = ""
+        if avaliacao is not None:
+            valor = str(avaliacao.get("nota", "")).strip()
+            if valor:
+                nota = valor.replace(".", ",")
+                avaliados += 1
+            observacao = " ".join(
+                str(avaliacao.get("comentario", "")).split()
+            ).strip()
+
+        atual = estado.get("nota_atual")
+        linhas.append(
+            [
+                nome,
+                entregou,
+                nota,
+                observacao,
+                f"{atual:g}" if atual is not None else "",
+            ]
+        )
+
+    titulo = f"Correção - {dados_atividade['title']} - {dados_turma['name']}"
+
+    resultado = criar_planilha(
+        titulo, linhas, nome_aba="Correção", conta=email
+    )
+
+    if not resultado.startswith("Criei"):
+        return resultado
+
+    # Cópia local, para o professor abrir sem depender de qual conta
+    # está logada no navegador.
+    caminho, erro_copia = salvar_copia_local(titulo, linhas)
+
+    sem_nota = len(alunos) - avaliados
+
+    partes = [
+        resultado,
+        f"São {len(alunos)} alunos: {avaliados} com nota sugerida e "
+        f"{sem_nota} em branco.",
+    ]
+
+    if caminho is not None:
+        partes.append(
+            f"Também salvei uma cópia na Área de Trabalho, como "
+            f"'{caminho.name}'. Diga esse nome ao usuário: é o caminho "
+            "mais simples, porque abre direto no computador. A planilha "
+            f"do Google está na conta {email}; se ele abrir o link com o "
+            "navegador logado em outra conta, vai pedir permissão."
+        )
+    elif erro_copia:
+        partes.append(f"Não consegui salvar a cópia local: {erro_copia}")
+
+    partes.append(
+        "Avise que a planilha é para ele conferir e digitar; ela não "
+        "lança nota nenhuma sozinha."
+    )
+
+    return " ".join(partes) + aviso
 
 
 def criar_planilha_de_notas(turma, colunas="", conta=""):

@@ -89,9 +89,14 @@ MENSAGEM_ATIVIDADE_DE_FORA = (
     "você criou pela interface do Classroom são somente leitura para "
     "mim, por regra da plataforma. Não é permissão faltando e não há "
     "configuração que resolva. "
-    "Explique isso ao usuário e ofereça duas saídas: ele lança essa "
-    "nota à mão no Classroom, ou passa a criar as atividades por mim "
-    "com criar_atividade, e aí eu consigo corrigir. "
+    "NÃO tente de novo: vai falhar igual. "
+    "Ofereça as saídas, nesta ordem: "
+    "1) eu avalio as entregas, monto uma planilha com as notas "
+    "sugeridas para ele conferir, e depois DIGITO na tela do Classroom "
+    "com preparar_transporte e lancar_proxima_nota; "
+    "2) ele lança à mão; "
+    "3) as próximas atividades ele cria por mim com criar_atividade, e "
+    "aí eu corrijo pela API, sem digitar em tela. "
     "Continuo lendo tudo normalmente: entregas, quem falta e o "
     "conteúdo enviado."
 )
@@ -827,6 +832,42 @@ def criar_atividade(
     )
 
 
+def _devolver_entrega(servico, id_turma, id_atividade, id_entrega, nota):
+    """
+    Promove a nota a atribuída e devolve. Devolve None ou o erro.
+
+    Separada para a devolução com comentário chamar pelo id da entrega,
+    já conferido, sem procurar o aluno pelo nome de novo.
+    """
+
+    _, erro = _executar(
+        servico.courses().courseWork().studentSubmissions().patch(
+            courseId=id_turma,
+            courseWorkId=id_atividade,
+            id=id_entrega,
+            updateMask="draftGrade,assignedGrade",
+            body={
+                "draftGrade": nota,
+                "assignedGrade": nota,
+            },
+        )
+    )
+    if erro:
+        return erro
+
+    # O método da API chama-se "return", que é palavra reservada em
+    # Python; a biblioteca do Google expõe como "return_".
+    _, erro = _executar(
+        servico.courses().courseWork().studentSubmissions().return_(
+            courseId=id_turma,
+            courseWorkId=id_atividade,
+            id=id_entrega,
+            body={},
+        )
+    )
+    return erro
+
+
 def devolver_atividade(turma, atividade, aluno):
     """
     Devolve o trabalho corrigido ao aluno.
@@ -859,45 +900,262 @@ def devolver_atividade(turma, atividade, aluno):
     if not entrega.get("associatedWithDeveloper", False):
         return MENSAGEM_ATIVIDADE_DE_FORA
 
-    if entrega.get("assignedGrade") is None:
+    # O lote grava só o rascunho. Devolver é o momento de promovê-lo a
+    # nota atribuída -- é exatamente o que o botão Devolver faz na tela.
+    nota = entrega.get("assignedGrade")
+    if nota is None:
+        nota = entrega.get("draftGrade")
+
+    if nota is None:
         return (
             f"{nome_aluno} ainda não tem nota nessa atividade. "
             "Lance a nota antes de devolver."
         )
 
-    _, erro = _executar(
-        servico.courses().courseWork().studentSubmissions().patch(
-            courseId=dados_turma["id"],
-            courseWorkId=dados_atividade["id"],
-            id=entrega["id"],
-            updateMask="draftGrade,assignedGrade",
-            body={
-                "draftGrade": entrega["assignedGrade"],
-                "assignedGrade": entrega["assignedGrade"],
-            },
-        )
-    )
-    if erro:
-        return erro
-
-    # O método da API chama-se "return", que é palavra reservada em
-    # Python; a biblioteca do Google expõe como "return_".
-    _, erro = _executar(
-        servico.courses().courseWork().studentSubmissions().return_(
-            courseId=dados_turma["id"],
-            courseWorkId=dados_atividade["id"],
-            id=entrega["id"],
-            body={},
-        )
+    erro = _devolver_entrega(
+        servico, dados_turma["id"], dados_atividade["id"], entrega["id"], nota
     )
     if erro:
         return erro
 
     return (
         f"Devolvi a atividade de {nome_aluno} com a nota "
-        f"{entrega['assignedGrade']:g}. Agora ele consegue ver a nota."
+        f"{float(nota):g}. Agora ele consegue ver a nota."
         + aviso
     )
+
+
+# ============================================================
+# LANÇAR A TURMA INTEIRA — SEM PERGUNTAR ALUNO POR ALUNO
+# ============================================================
+#
+# Confirmar nota por nota tornava a correção de uma turma de 30 alunos
+# uma sequência de 30 perguntas. O professor pediu o contrário: corrigir
+# tudo, e ele revisa depois.
+#
+# O que torna isso seguro é o RASCUNHO. draftGrade aparece para o
+# professor com "Rascunho" embaixo e é invisível para o aluno. A nota
+# só chega ao aluno quando o professor devolve -- e devolver continua
+# sendo decisão dele. Por isso este lote grava só draftGrade, nunca
+# assignedGrade.
+
+def lancar_notas_em_lote(turma, atividade, avaliacoes):
+    """
+    Lança como rascunho as notas de vários alunos de uma vez.
+
+    avaliacoes: lista de {"aluno", "nota", "comentario"}.
+
+    Três travas, porque aqui não há confirmação por aluno:
+    - escala conferida ANTES de lançar qualquer coisa: uma nota acima do
+      valor da atividade recusa o lote inteiro;
+    - quem já tem nota é pulado. Trocar a nota que o professor deu passa
+      pelos dois passos de preparar_nota, com confirmação;
+    - só draftGrade. Nada chega ao aluno sem o professor devolver.
+    """
+
+    if not servicos():
+        return _sem_contas()
+
+    if not isinstance(avaliacoes, (list, tuple)) or not avaliacoes:
+        return "Não recebi nenhuma nota para lançar."
+
+    contexto, erro = _encontrar_turma(turma)
+    if erro:
+        return erro
+
+    email, servico, _, dados_turma, aviso = contexto
+
+    dados_atividade, erro = _encontrar_atividade(
+        servico, dados_turma["id"], atividade
+    )
+    if erro:
+        return erro
+
+    maximo = dados_atividade.get("maxPoints")
+
+    # Tudo validado antes da primeira gravação. Metade da turma lançada
+    # e metade recusada seria o pior estado para o professor revisar.
+    itens = []
+    problemas = []
+
+    for bruta in avaliacoes:
+        if not isinstance(bruta, dict):
+            continue
+
+        nome = str(bruta.get("aluno", "")).strip()
+        if not nome:
+            continue
+
+        try:
+            valor = float(str(bruta.get("nota", "")).replace(",", "."))
+        except ValueError:
+            problemas.append(f"{nome} está com '{bruta.get('nota')}'")
+            continue
+
+        if valor < 0 or (maximo and valor > float(maximo) + 0.001):
+            problemas.append(f"{nome} com {valor:g}")
+            continue
+
+        comentario = " ".join(str(bruta.get("comentario", "") or "").split())
+        itens.append((nome, valor, comentario))
+
+    if problemas:
+        limite = f"de 0 a {maximo:g}" if maximo else "sem negativos"
+        return (
+            f"Não lancei nenhuma nota. A atividade "
+            f"'{dados_atividade['title']}' aceita notas {limite}, e estas "
+            f"estão fora: {', '.join(problemas[:5])}. "
+            "Corrija essas notas e chame de novo com a lista inteira. "
+            "Não precisa reler as entregas."
+        )
+
+    if not itens:
+        return "Nenhuma das avaliações trazia aluno e nota."
+
+    alunos, erro = _mapa_de_alunos(servico, dados_turma["id"])
+    if erro:
+        return erro
+
+    resposta, erro = _executar(
+        servico.courses().courseWork().studentSubmissions().list(
+            courseId=dados_turma["id"],
+            courseWorkId=dados_atividade["id"],
+            pageSize=200,
+        )
+    )
+    if erro:
+        return erro
+
+    entregas = {
+        e.get("userId", ""): e for e in resposta.get("studentSubmissions", [])
+    }
+
+    # Uma verificação só, antes de tudo: sem isto seriam 30 recusas
+    # iguais, uma por aluno.
+    if entregas and not any(
+        e.get("associatedWithDeveloper", False) for e in entregas.values()
+    ):
+        return MENSAGEM_ATIVIDADE_DE_FORA
+
+    lancados = []
+    ja_tinham = []
+    nao_achados = []
+    ambiguos = []
+    falhas = []
+    vistos = set()
+
+    # Comentário particular não tem rascunho: chega ao aluno na hora.
+    # Por isso fica guardado e só vai na devolução, junto com a nota,
+    # depois que o professor revisou. Ver devolucao_comentada.
+    comentarios = {}
+
+    for nome, valor, comentario in itens:
+        exatos = [(u, n) for u, n in alunos.items() if _casa(nome, n)]
+        parciais = [(u, n) for u, n in alunos.items() if _contem(nome, n)]
+        candidatos = exatos or parciais
+
+        if not candidatos:
+            nao_achados.append(nome)
+            continue
+
+        # Nome que casa com dois alunos não vira chute: a nota iria para
+        # um deles por sorte.
+        if len(candidatos) > 1:
+            ambiguos.append(nome)
+            continue
+
+        id_aluno, nome_real = candidatos[0]
+
+        if id_aluno in vistos:
+            continue
+        vistos.add(id_aluno)
+
+        entrega = entregas.get(id_aluno)
+        if entrega is None:
+            nao_achados.append(nome_real)
+            continue
+
+        atual = entrega.get("assignedGrade")
+        if atual is None:
+            atual = entrega.get("draftGrade")
+
+        # Pula quem já tem nota. Também torna o lote seguro de repetir:
+        # rodar de novo depois de uma queda não duplica nem sobrescreve.
+        if atual is not None:
+            ja_tinham.append(f"{nome_real} ({float(atual):g})")
+            continue
+
+        _, erro = _executar(
+            servico.courses().courseWork().studentSubmissions().patch(
+                courseId=dados_turma["id"],
+                courseWorkId=dados_atividade["id"],
+                id=entrega["id"],
+                updateMask="draftGrade",
+                body={"draftGrade": valor},
+            )
+        )
+
+        if erro:
+            falhas.append(f"{nome_real}: {erro}")
+        else:
+            lancados.append(f"{nome_real} {valor:g}")
+            if comentario:
+                comentarios[id_aluno] = {"aluno": nome_real, "texto": comentario}
+
+    partes = [
+        f"Lancei {len(lancados)} notas como RASCUNHO em "
+        f"'{dados_atividade['title']}', turma {dados_turma['name']}."
+    ]
+
+    if lancados:
+        partes.append(
+            "Os alunos ainda NÃO veem nada: a nota só aparece para eles "
+            "quando o professor revisar e devolver."
+        )
+
+    if ja_tinham:
+        partes.append(
+            f"Pulei {len(ja_tinham)} que já tinham nota, para não "
+            f"sobrescrever: {', '.join(ja_tinham[:10])}. Para trocar "
+            "alguma, é com preparar_nota, confirmando com o professor."
+        )
+
+    if nao_achados:
+        partes.append(f"Não encontrei na turma: {', '.join(nao_achados[:10])}.")
+
+    if ambiguos:
+        partes.append(
+            f"Nome que serve para mais de um aluno, pulei: "
+            f"{', '.join(ambiguos[:10])}. Peça o nome completo."
+        )
+
+    if falhas:
+        partes.append(f"Falharam: {'; '.join(falhas[:5])}.")
+
+    if comentarios:
+        from actions.devolucao_comentada import guardar_comentarios
+
+        guardados, erro_guarda = guardar_comentarios(
+            email, dados_turma, dados_atividade, comentarios
+        )
+
+        if guardados:
+            partes.append(
+                f"Guardei o comentário de {guardados} alunos. Ele vai para "
+                "o aluno junto com a nota, quando o professor mandar "
+                "devolver -- não antes, porque comentário no Classroom não "
+                "tem rascunho e o aluno leria antes da revisão."
+            )
+        elif erro_guarda:
+            partes.append(erro_guarda)
+
+    partes.append(
+        "Se ele quiser ler os comentários antes, ofereça a planilha de "
+        "correção. Diga os números em voz alta; não leia a lista inteira "
+        "de nomes quando for longa."
+    )
+
+    return " ".join(partes) + aviso
 
 
 # ============================================================

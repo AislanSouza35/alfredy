@@ -860,3 +860,97 @@ def test_log_de_falha_nao_guarda_o_trabalho_do_aluno(monkeypatch):
     GeminiLiveWorker.registrar_resultado_de_ferramenta("ler_entrega", longo)
 
     assert len(registrados[0]) < 250
+
+
+# ============================================================
+# Abertura da chamada
+# ============================================================
+#
+# A instrução manda o ALF exigir a palavra-chave e, até lá, não
+# preencher o silêncio. Numa sessão nova não existe turno nenhum, então
+# ele cumpria só a segunda metade: recebia o áudio do microfone e
+# decidia não responder. A chamada nascia muda, e o único jeito de
+# destravar era o botão de analisar tela -- que manda a imagem como
+# turno do usuário.
+
+
+class _SessaoDeAbertura:
+    def __init__(self, falhar=False):
+        self.chamadas = []
+        self.falhar = falhar
+
+    async def send_client_content(self, **kwargs):
+        if self.falhar:
+            raise RuntimeError("socket caiu")
+        self.chamadas.append(kwargs)
+
+
+def test_abertura_manda_o_alf_falar_primeiro():
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.lock_envio = asyncio.Lock()
+        sessao = _SessaoDeAbertura()
+
+        await worker.abrir_conversa(sessao)
+
+        assert len(sessao.chamadas) == 1
+        turno = sessao.chamadas[0]["turns"]
+        assert turno.role == "user"
+        assert sessao.chamadas[0]["turn_complete"] is True
+        # É a deixa para ele pedir a chave, não a chave.
+        assert "palavra-chave" in turno.parts[0].text
+        assert "Arlan" not in turno.parts[0].text
+
+    asyncio.run(executar())
+
+
+def test_abertura_que_falha_nao_derruba_a_chamada():
+    """Sem abertura a chamada ainda serve; sem sessão, não."""
+
+    async def executar():
+        worker = GeminiLiveWorker()
+        worker.lock_envio = asyncio.Lock()
+
+        await worker.abrir_conversa(_SessaoDeAbertura(falhar=True))
+
+    asyncio.run(executar())
+
+
+def test_silenciamento_nao_atravessa_a_reconexao():
+    """
+    Cair no meio de um turno silenciado deixava o sinalizador em True.
+    Na sessão nova o ALF descartava a própria fala: mudo para sempre.
+    """
+    from pathlib import Path
+
+    codigo = Path("gemini/live_client.py").read_text(encoding="utf-8")
+
+    # O zeramento precisa estar no bloco que a abertura da sessão roda,
+    # ao lado dos outros sinalizadores que a queda pode ter travado.
+    inicio = codigo.index("Sessao Gemini Live aberta com sucesso")
+    bloco = codigo[inicio - 1500:inicio]
+
+    assert "self.alfred_falando = False" in bloco
+    assert "self.silenciar_audio_ate_fim_turno = False" in bloco
+
+
+def test_tarefas_da_sessao_sao_canceladas_mesmo_com_erro():
+    """
+    O cancelamento ficava depois do laço, dentro do try. Uma tarefa
+    interna que morresse levantava RuntimeError e pulava por cima dele:
+    as tarefas da sessão morta continuavam vivas, cada uma segurando o
+    seu fluxo de áudio. A sessão nova abria mais um, os dois liam o
+    mesmo buffer, e saíam duas vozes ao mesmo tempo.
+    """
+    from pathlib import Path
+
+    codigo = Path("gemini/live_client.py").read_text(encoding="utf-8")
+
+    cancelamento = codigo.index("for tarefa in tarefas:")
+    fechamento = codigo.index("gerenciador_conexao.__aexit__")
+    finalmente = codigo.rindex("finally:", 0, cancelamento)
+
+    # O cancelamento precisa estar dentro do finally, e antes de a
+    # conexão fechar: a placa de som é solta primeiro.
+    assert finalmente < cancelamento < fechamento
+    assert "try:" not in codigo[finalmente:cancelamento]

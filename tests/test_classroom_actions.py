@@ -431,10 +431,14 @@ def test_ferramenta_registrada(ferramenta):
     assert f'name="{ferramenta}"' in CODIGO_CLIENTE
 
 
-def test_instrucao_exige_dois_turnos_e_proibe_inventar_nota():
-    assert "Nunca chame confirmar_nota no mesmo turno" in CODIGO_CLIENTE
-    assert "Nunca invente nota" in CODIGO_CLIENTE
-    assert "deixe" in CODIGO_CLIENTE and "decisão com o professor" in CODIGO_CLIENTE
+def test_instrucao_exige_dois_turnos_para_trocar_nota_existente():
+    """
+    O professor passou a deixar o ALF decidir as notas da turma, como
+    rascunho. O que continua em dois passos é trocar uma nota que já
+    existe, e devolver continua sendo decisão dele.
+    """
+    assert "nunca chame confirmar_nota no mesmo turno" in CODIGO_CLIENTE
+    assert "essa decisão é do professor" in CODIGO_CLIENTE
 
 
 # ============================================================
@@ -615,7 +619,11 @@ def test_recusa_explica_que_nao_e_permissao(servico):
     resultado = sala.preparar_nota("3A", "Prova 1", "Ana", "8")
 
     assert "Não é permissão faltando" in resultado
-    assert "lança essa nota à mão" in resultado
+    # A recusa precisa apontar o caminho, não só dizer não: sem isso o
+    # modelo tentou a mesma função bloqueada cinco vezes seguidas.
+    assert "NÃO tente de novo" in resultado
+    assert "preparar_transporte" in resultado
+    assert "lança à mão" in resultado
 
 
 def test_nao_devolve_atividade_criada_fora(servico):
@@ -700,3 +708,126 @@ def test_confirmacao_diz_a_data_que_o_professor_pediu(servico, monkeypatch):
 
     assert "25/12 às 23:59" in resultado
     assert "26/12" not in resultado
+
+
+# ============================================================
+# Corrigir a turma inteira, sem confirmar aluno por aluno
+# ============================================================
+#
+# Confirmar nota por nota transformava uma turma de 30 alunos em 30
+# perguntas. O lote dispensa isso porque grava RASCUNHO: o aluno não vê
+# nada até o professor revisar e devolver.
+
+
+def _lote(*pares):
+    return [{"aluno": a, "nota": n, "comentario": "ok"} for a, n in pares]
+
+
+def test_lote_lanca_todos_sem_pedir_confirmacao(servico):
+    resultado = sala.lancar_notas_em_lote(
+        "3A", "Prova 1", _lote(("Ana", "8"), ("Bruno", "7,5"))
+    )
+
+    assert [p["body"] for p in servico.patches] == [
+        {"draftGrade": 8.0},
+        {"draftGrade": 7.5},
+    ]
+    assert "RASCUNHO" in resultado
+    assert "NÃO veem nada" in resultado
+    # Nenhuma nota ficou esperando confirmação.
+    assert sala.nota_pendente() is None
+
+
+def test_lote_nunca_grava_nota_atribuida(servico):
+    """assignedGrade é o que o aluno vê. Isso só na devolução."""
+    sala.lancar_notas_em_lote("3A", "Prova 1", _lote(("Ana", "8")))
+
+    for patch in servico.patches:
+        assert patch["updateMask"] == "draftGrade"
+        assert "assignedGrade" not in patch["body"]
+
+
+def test_lote_nao_sobrescreve_nota_existente(servico):
+    servico._entregas[0]["assignedGrade"] = 9
+
+    resultado = sala.lancar_notas_em_lote(
+        "3A", "Prova 1", _lote(("Ana", "8"), ("Bruno", "7"))
+    )
+
+    assert [p["id"] for p in servico.patches] == ["e2"]
+    assert "Ana Souza (9)" in resultado
+    assert "preparar_nota" in resultado
+
+
+def test_lote_e_seguro_de_repetir(servico):
+    """Rodar de novo depois de uma queda não mexe no que já foi."""
+    servico._entregas[0]["draftGrade"] = 8
+
+    sala.lancar_notas_em_lote("3A", "Prova 1", _lote(("Ana", "8")))
+
+    assert servico.patches == []
+
+
+def test_lote_com_escala_errada_nao_lanca_ninguem(servico):
+    """Metade lançada e metade recusada seria o pior estado para revisar."""
+    resultado = sala.lancar_notas_em_lote(
+        "3A", "Prova 1", _lote(("Ana", "8"), ("Bruno", "80"))
+    )
+
+    assert servico.patches == []
+    assert "Não lancei nenhuma nota" in resultado
+    assert "Bruno com 80" in resultado
+
+
+def test_lote_em_atividade_de_fora_recusa_uma_vez(servico):
+    for entrega in servico._entregas:
+        entrega["associatedWithDeveloper"] = False
+
+    resultado = sala.lancar_notas_em_lote(
+        "3A", "Prova 1", _lote(("Ana", "8"), ("Bruno", "7"))
+    )
+
+    assert servico.patches == []
+    assert "criadas por mim" in resultado
+
+
+def test_aluno_desconhecido_nao_trava_os_outros(servico):
+    resultado = sala.lancar_notas_em_lote(
+        "3A", "Prova 1", _lote(("Carla", "5"), ("Ana", "8"))
+    )
+
+    assert [p["id"] for p in servico.patches] == ["e1"]
+    assert "Carla" in resultado
+
+
+def test_lote_guarda_comentario_para_a_devolucao(servico):
+    """
+    Comentário particular chega ao aluno na hora. Guardado, ele só vai
+    junto com a nota, depois que o professor revisou.
+    """
+    from actions import devolucao_comentada as dc
+
+    resultado = sala.lancar_notas_em_lote("3A", "Prova 1", _lote(("Ana", "8")))
+
+    assert dc.comentarios_da_atividade("t1", "a1")["u1"]["texto"] == "ok"
+    assert "quando o professor mandar devolver" in resultado
+
+
+def test_devolve_usando_a_nota_em_rascunho(servico):
+    """O lote grava rascunho; devolver precisa aceitar isso."""
+    servico._entregas[0]["draftGrade"] = 8
+    devolvidos = []
+    servico.return_ = lambda **kwargs: devolvidos.append(kwargs) or _Requisicao({})
+
+    resultado = sala.devolver_atividade("3A", "Prova 1", "Ana")
+
+    assert servico.patches[-1]["body"] == {"draftGrade": 8, "assignedGrade": 8}
+    assert devolvidos
+    assert "nota 8" in resultado
+
+
+def test_instrucao_corrige_a_turma_sem_interromper():
+    assert "NÃO peça confirmação aluno" in CODIGO_CLIENTE
+    assert "lancar_notas_em_lote" in CODIGO_CLIENTE
+    # A trava que sobra: devolver continua sendo decisão do professor.
+    assert "Nunca devolva a atividade por conta própria" in CODIGO_CLIENTE
