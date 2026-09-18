@@ -310,6 +310,13 @@ ESPERA_MAXIMA_RECONEXAO = 20.0
 JANELA_CICLO_RECONEXAO = 180.0
 MAX_RECONEXOES_NA_JANELA = 6
 
+# Cota esgotada não é queda de rede: reabrir na hora gasta mais cota e
+# alimenta o ciclo. Em 18/09/2026 foram 27 sessões abertas e cinco
+# recusas por cota, com o ALF mudo entre elas -- ele reabria sozinho a
+# cada poucos segundos, sem nunca dizer o motivo.
+ESPERA_APOS_COTA = 60.0
+MAX_QUEDAS_POR_COTA = 2
+
 # Tempo mínimo entre duas chamadas visuais iguais.
 #
 # Serve apenas para juntar as chamadas duplicadas que o modelo dispara
@@ -425,6 +432,8 @@ class GeminiLiveWorker(QThread):
         self.ativo = True
         # Evita repetir o aviso de memória a cada renovação de conexão.
         self.memoria_apertada = False
+        # Quedas seguidas por cota esgotada da chave do Gemini.
+        self.quedas_por_cota = 0
         # Guardará o loop assíncrono desta thread.
         self.loop = None
         # Limpa a referência da sessão encerrada.
@@ -3291,6 +3300,30 @@ class GeminiLiveWorker(QThread):
                 else:
                     duracao_sessao = 0.0
 
+                # Antes de tudo: cota esgotada tem tratamento próprio.
+                # Sem isto, o ALF reabria em poucos segundos, era recusado
+                # de novo, e o professor só via a chamada muda.
+                if self.parece_cota_esgotada(erro):
+                    decisao, detalhe = self.decidir_apos_cota(duracao_sessao)
+
+                    self.registrar_diagnostico(
+                        f"Cota esgotada ({self.quedas_por_cota}a vez). "
+                        f"Decisao: {decisao}."
+                    )
+
+                    if decisao == "parar":
+                        self.erro_recebido.emit(detalhe)
+                        raise RuntimeError(detalhe) from erro
+
+                    self.status_recebido.emit(
+                        "O Google recusou por cota esgotada. Esperando "
+                        f"{detalhe:.0f}s antes de tentar de novo, para não "
+                        "gastar mais cota."
+                    )
+                    self.solicitou_reconexao.emit()
+                    await asyncio.sleep(detalhe)
+                    continue
+
                 tentativas_reconexao = self.calcular_tentativas_apos_queda(
                     tentativas_reconexao,
                     duracao_sessao,
@@ -5426,6 +5459,55 @@ class GeminiLiveWorker(QThread):
                 ]
             ),
         )
+
+    @staticmethod
+    def parece_cota_esgotada(erro):
+        """
+        Diz se a queda foi o Google recusando por cota, não a rede.
+
+        A Live API fecha com 1011 "Resource has been exhausted"; o resto
+        da API usa 429 / RESOURCE_EXHAUSTED. Nenhum deles se resolve
+        reconectando: só o tempo resolve.
+        """
+
+        texto = str(erro).lower()
+
+        return (
+            "1011" in texto
+            or "resource has been exhausted" in texto
+            or "resource_exhausted" in texto
+            or "429" in texto
+            or "quota" in texto
+        )
+
+    def decidir_apos_cota(self, duracao_sessao):
+        """
+        Devolve ("esperar", segundos) ou ("parar", mensagem).
+
+        Espera longa nas primeiras vezes, porque o limite por minuto
+        passa sozinho. Depois disso para e explica: insistir só queima o
+        que sobrou, e limite diário não passa esperando um minuto.
+        """
+
+        # Uma sessão que durou bem antes de cair é um incidente novo,
+        # não a continuação do mesmo ciclo.
+        if duracao_sessao >= TEMPO_SESSAO_ESTAVEL:
+            self.quedas_por_cota = 1
+        else:
+            self.quedas_por_cota += 1
+
+        if self.quedas_por_cota > MAX_QUEDAS_POR_COTA:
+            return "parar", (
+                "A cota da sua chave do Gemini se esgotou: o Google está "
+                "recusando as sessões (erro 1011). Encerrei a chamada de "
+                "propósito -- reabrir agora só gasta o que sobrou da cota. "
+                "Espere alguns minutos e tente de novo; se continuar, o "
+                "limite pode ser o diário, e aí só volta amanhã ou com "
+                "faturamento ativado no projeto. Dá para conferir o "
+                "consumo no Google AI Studio, em API keys."
+            )
+
+        return "esperar", ESPERA_APOS_COTA
 
     @staticmethod
     def calcular_tentativas_apos_queda(
