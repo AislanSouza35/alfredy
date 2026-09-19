@@ -54,9 +54,23 @@ def test_portao_continua_exigindo_a_palavra_chave():
 # A demora
 # ============================================================
 
+def test_conta_a_partir_da_voz_do_usuario_e_nao_do_turno_anterior():
+    """
+    A primeira versão media do fim do turno anterior. Silêncio do
+    usuário virava lentidão do ALF: apareceram "demoras" de 38 s e 94 s
+    que eram só ele pensando antes de falar.
+    """
+    from pathlib import Path
+
+    codigo = Path("gemini/live_client.py").read_text(encoding="utf-8")
+
+    assert "self.momento_ultima_voz = time.monotonic()" in codigo
+    assert "nivel_microfone >= LIMIAR_VOZ_MICROFONE" in codigo
+
+
 def test_mede_quanto_tempo_levou_para_responder():
     worker = GeminiLiveWorker()
-    worker.momento_fim_da_fala = time.monotonic() - 2.0
+    worker.momento_ultima_voz = time.monotonic() - 2.0
 
     atraso = worker.registrar_atraso_da_resposta()
 
@@ -66,7 +80,7 @@ def test_mede_quanto_tempo_levou_para_responder():
 def test_so_o_primeiro_pedaco_do_turno_conta():
     """A resposta chega em muitos pedaços; a demora é até o primeiro."""
     worker = GeminiLiveWorker()
-    worker.momento_fim_da_fala = time.monotonic()
+    worker.momento_ultima_voz = time.monotonic()
 
     assert worker.registrar_atraso_da_resposta() is not None
     assert worker.registrar_atraso_da_resposta() is None

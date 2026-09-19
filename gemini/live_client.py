@@ -434,9 +434,9 @@ class GeminiLiveWorker(QThread):
         self.memoria_apertada = False
         # Quedas seguidas por cota esgotada da chave do Gemini.
         self.quedas_por_cota = 0
-        # Momento em que o usuário parou de falar, para medir a demora
-        # até a resposta começar.
-        self.momento_fim_da_fala = None
+        # Última vez que o microfone ouviu voz de verdade. É daqui que
+        # sai a medida de quanto o ALF demora para responder.
+        self.momento_ultima_voz = None
         # Guardará o loop assíncrono desta thread.
         self.loop = None
         # Limpa a referência da sessão encerrada.
@@ -3553,13 +3553,16 @@ class GeminiLiveWorker(QThread):
                 if self.alfred_falando or self.processando_ferramenta:
                     continue
 
-                # O nível só é necessário quando o VAD local está ligado.
-                if USAR_VAD_CLIENTE:
-                    nivel_microfone = self.calcular_nivel_audio(
-                        audio_bytes
-                    )
-                else:
-                    nivel_microfone = 0.0
+                # O nível é medido sempre, e não só quando o VAD local
+                # está ligado: é ele que marca quando o usuário falou
+                # pela última vez. Sem isso, a medida de demora começava
+                # no fim do turno anterior e contava como lentidão do
+                # ALF todo o tempo em que o usuário ficou calado -- foi
+                # assim que apareceram "demoras" de 38 s e 94 s.
+                nivel_microfone = self.calcular_nivel_audio(audio_bytes)
+
+                if nivel_microfone >= LIMIAR_VOZ_MICROFONE:
+                    self.momento_ultima_voz = time.monotonic()
 
                 # Envia o bloco ao Gemini em tempo real.
                 async with self.lock_envio:
@@ -5082,21 +5085,26 @@ class GeminiLiveWorker(QThread):
         Grava quanto tempo o ALF levou para começar a responder.
 
         "Demora muito para responder" é uma queixa que não dá para
-        investigar sem número. Mede do fim da fala do usuário até o
-        primeiro pedaço de áudio da resposta chegar.
+        investigar sem número. Mede da última voz ouvida no microfone
+        até o primeiro pedaço de áudio da resposta chegar.
 
-        Devolve os segundos, ou None quando não há fala esperando
-        resposta -- os pedaços seguintes do mesmo turno não contam.
+        Inclui o tempo que o servidor leva para decidir que a fala
+        acabou, o que é honesto: para quem está esperando, isso também
+        é demora.
+
+        Devolve os segundos, ou None quando ninguém falou desde a última
+        resposta -- os pedaços seguintes do mesmo turno não contam, e
+        silêncio do usuário não vira lentidão do ALF.
         """
 
-        if self.momento_fim_da_fala is None:
+        if self.momento_ultima_voz is None:
             return None
 
-        atraso = time.monotonic() - self.momento_fim_da_fala
-        self.momento_fim_da_fala = None
+        atraso = time.monotonic() - self.momento_ultima_voz
+        self.momento_ultima_voz = None
 
         self.registrar_diagnostico(
-            f"Resposta comecou {atraso:.1f}s depois de o usuario parar de falar."
+            f"Resposta comecou {atraso:.1f}s depois da ultima voz ouvida."
         )
 
         return atraso
@@ -5231,7 +5239,6 @@ class GeminiLiveWorker(QThread):
             self.fluxo_audio_em_andamento = False
             self.usuario_falando_detectado = False
             self.ultimo_audio_com_voz = None
-            self.momento_fim_da_fala = time.monotonic()
             self.registrar_diagnostico(
                 "Fluxo de audio do microfone finalizado com audio_stream_end."
             )
