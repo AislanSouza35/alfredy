@@ -832,7 +832,15 @@ def test_ferramenta_que_falha_e_registrada(tmp_path, monkeypatch):
     assert "preparar_nota" in registrados[0]
 
 
-def test_ferramenta_bem_sucedida_nao_polui_o_log(monkeypatch):
+def test_ferramenta_bem_sucedida_registra_so_o_nome(monkeypatch):
+    """
+    Antes o sucesso não era registrado, para não poluir o log. Isso
+    deixou um buraco: quando o ALF disse que não conseguia escrever num
+    campo do Chrome, o log ficou vazio, e não deu para saber se ele
+    tinha tentado e falhado ou se nem tinha chamado a função.
+
+    O nome entra; o conteúdo, não.
+    """
     registrados = []
     monkeypatch.setattr(
         GeminiLiveWorker,
@@ -844,7 +852,7 @@ def test_ferramenta_bem_sucedida_nao_polui_o_log(monkeypatch):
         "listar_turmas", "Você tem 51 turmas ativas."
     )
 
-    assert registrados == []
+    assert registrados == ["Ferramenta 'listar_turmas' concluiu."]
 
 
 def test_log_de_falha_nao_guarda_o_trabalho_do_aluno(monkeypatch):

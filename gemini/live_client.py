@@ -2720,6 +2720,22 @@ class GeminiLiveWorker(QThread):
                 "Não chame essa função para respostas comuns da conversa. "
                 "Não use essa função para enviar mensagens automaticamente. "
 
+                # escrever_no_campo_ativo escreve onde o cursor JÁ está.
+                # Num navegador o cursor quase nunca está no campo que o
+                # usuário quer, e o texto ia parar em lugar nenhum -- daí
+                # o ALF dizer que "não consegue escrever no campo".
+                "Para escrever num campo de um site ou de um programa -- "
+                "barra de endereço do Chrome, caixa de busca, campo de "
+                "formulário --, são DOIS passos: primeiro clicar_elemento_"
+                "visual no campo, descrevendo-o pelo que está escrito "
+                "perto dele, e só então escrever_no_campo_ativo. "
+                "escrever_no_campo_ativo sozinho escreve onde o cursor já "
+                "estiver, e o cursor raramente está onde você imagina. "
+                "Se o clique não achar o campo, diga ao usuário exatamente "
+                "o que a função respondeu e peça para ele clicar no campo; "
+                "nunca diga apenas que não consegue escrever, sem explicar "
+                "em que passo parou. "
+
                 # =========================
                 # ATALHOS DE TECLADO
                 # =========================
@@ -5415,22 +5431,30 @@ class GeminiLiveWorker(QThread):
     @classmethod
     def registrar_resultado_de_ferramenta(cls, nome, resultado):
         """
-        Registra no log a ferramenta que falhou.
+        Registra no log qual ferramenta rodou e se ela concluiu.
 
         Quando o lançamento de nota parou de funcionar, o erro voltava
         para o modelo e sumia: não havia como saber depois o que tinha
         acontecido. Sem isto, diagnosticar dependia de reproduzir o
         problema ao vivo.
 
-        Só falhas são registradas, e apenas o começo da mensagem: o
-        resultado de uma ferramenta costuma trazer nome e trabalho de
-        aluno, que não têm por que ficar guardados em arquivo.
+        Antes só as falhas eram registradas, e isso deixava um buraco:
+        quando o ALF dizia que não conseguia escrever num campo do
+        Chrome, o log ficava vazio, e não dava para saber se ele tinha
+        tentado e falhado ou se nem tinha chamado a função. Agora o
+        sucesso também aparece -- só o nome.
+
+        Da falha fica apenas o começo da mensagem, e do sucesso não fica
+        nada do conteúdo: o resultado de uma ferramenta costuma trazer
+        nome e trabalho de aluno, que não têm por que ficar guardados em
+        arquivo.
         """
 
         texto = str(resultado or "")
         minusculo = texto.lower()
 
         if not any(sinal in minusculo for sinal in cls.SINAIS_DE_FALHA):
+            cls.registrar_diagnostico(f"Ferramenta '{nome}' concluiu.")
             return
 
         cls.registrar_diagnostico(
