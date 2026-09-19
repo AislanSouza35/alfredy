@@ -65,6 +65,19 @@ GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 # Sem a chave, nada muda: ele continua encerrando com a explicação de
 # sempre. Nesta alternativa ele NÃO enxerga a tela; a visão é do Gemini.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Liga a alternativa desde o começo da chamada, sem esperar a cota do
+# Gemini acabar. Serve para testar o caminho alternativo com calma: o
+# primeiro uso de verdade não deveria acontecer no meio de uma aula,
+# justamente quando tudo já deu errado.
+#
+# No .env: ALF_VOZ_ALTERNATIVA=1  (aceita 1, sim, true, on)
+FORCAR_VOZ_ALTERNATIVA = os.getenv("ALF_VOZ_ALTERNATIVA", "").strip().lower() in (
+    "1",
+    "sim",
+    "true",
+    "on",
+)
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 

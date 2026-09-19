@@ -57,6 +57,7 @@ from core.config import (
     GEMINI_API_KEY,
     GEMINI_LIVE_MODEL,
     GEMINI_VOICE,
+    FORCAR_VOZ_ALTERNATIVA,
     OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_VOICE,
@@ -582,6 +583,11 @@ class GeminiLiveWorker(QThread):
         )
 
         self.avisar_se_memoria_apertada()
+
+        self.usando_alternativa, aviso_provedor = self.decidir_provedor_inicial()
+        if aviso_provedor:
+            self.status_recebido.emit(aviso_provedor)
+            self.registrar_diagnostico(aviso_provedor)
 
         # Cria o cliente autenticado da API Gemini.
         # No Windows/OpenSSL 3.5, algumas cadeias confiáveis pelo sistema
@@ -5602,6 +5608,35 @@ class GeminiLiveWorker(QThread):
             or "resource_exhausted" in texto
             or "429" in texto
             or "quota" in texto
+        )
+
+    @staticmethod
+    def decidir_provedor_inicial():
+        """
+        Diz por qual provedor a chamada começa.
+
+        Devolve (usar_alternativa, mensagem). A mensagem é vazia no caso
+        normal; quando a alternativa é forçada, ela avisa -- ninguém
+        deveria descobrir por acaso que está falando com outro provedor.
+
+        Forçar sem a chave não vira silêncio nem erro no meio da
+        chamada: ele segue no Gemini e diz o que faltou.
+        """
+
+        if not FORCAR_VOZ_ALTERNATIVA:
+            return False, ""
+
+        if not OPENAI_API_KEY:
+            return False, (
+                "ALF_VOZ_ALTERNATIVA está ligada, mas falta OPENAI_API_KEY "
+                "no .env. Continuando pelo Gemini."
+            )
+
+        return True, (
+            "Alternativa de voz ligada por configuração "
+            "(ALF_VOZ_ALTERNATIVA): esta chamada usa a OpenAI, não o "
+            "Gemini. Nela eu não enxergo a tela. "
+            "Para voltar ao normal, apague essa linha do .env."
         )
 
     def pode_trocar_para_alternativa(self):
