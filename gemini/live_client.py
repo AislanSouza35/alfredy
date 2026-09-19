@@ -57,7 +57,14 @@ from core.config import (
     GEMINI_API_KEY,
     GEMINI_LIVE_MODEL,
     GEMINI_VOICE,
+    OPENAI_API_KEY,
+    OPENAI_REALTIME_MODEL,
+    OPENAI_REALTIME_VOICE,
 )
+
+# Alternativa para quando a cota do Gemini acaba. Ela tem a mesma cara
+# da sessão do Gemini, então o laço de recebimento não muda.
+from voz.openai_realtime import conectar as conectar_alternativa
 from core.memoria import memoria_apertada
 from core.gemini_ssl import (
     criar_contexto_ssl_gemini,
@@ -434,6 +441,9 @@ class GeminiLiveWorker(QThread):
         self.memoria_apertada = False
         # Quedas seguidas por cota esgotada da chave do Gemini.
         self.quedas_por_cota = 0
+        # True depois de passar para a alternativa de voz, até o fim da
+        # chamada: voltar sozinho para o Gemini só gastaria cota de novo.
+        self.usando_alternativa = False
         # Última vez que o microfone ouviu voz de verdade. É daqui que
         # sai a medida de quanto o ALF demora para responder.
         self.momento_ultima_voz = None
@@ -3105,10 +3115,12 @@ class GeminiLiveWorker(QThread):
             # data/hora embutida na instrução nunca fica velha numa
             # chamada longa (o que fazia o ALF errar "hoje" e "amanhã"
             # na agenda).
+            instrucao_agora = self.atualizar_instrucao_sistema(
+                instrucao_sistema
+            )
+
             config = self.criar_config_live(
-                instrucao_sistema=self.atualizar_instrucao_sistema(
-                    instrucao_sistema
-                ),
+                instrucao_sistema=instrucao_agora,
                 tools=tools,
                 session_handle=self.session_handle,
             )
@@ -3150,10 +3162,22 @@ class GeminiLiveWorker(QThread):
             try:
                 # Abre a sessão Live com limite para não deixar a interface
                 # presa indefinidamente enquanto a rede ou a API não responde.
-                gerenciador_conexao = client.aio.live.connect(
-                    model=GEMINI_LIVE_MODEL,
-                    config=config,
-                )
+                if self.usando_alternativa:
+                    # Mesma superfície da sessão do Gemini: o laço de
+                    # recebimento, o microfone e as ferramentas seguem
+                    # iguais. Ver voz/openai_realtime.py.
+                    gerenciador_conexao = conectar_alternativa(
+                        OPENAI_API_KEY,
+                        OPENAI_REALTIME_MODEL,
+                        instrucao_agora,
+                        tools,
+                        OPENAI_REALTIME_VOICE,
+                    )
+                else:
+                    gerenciador_conexao = client.aio.live.connect(
+                        model=GEMINI_LIVE_MODEL,
+                        config=config,
+                    )
                 sessao = await asyncio.wait_for(
                     gerenciador_conexao.__aenter__(),
                     timeout=TEMPO_LIMITE_CONEXAO,
@@ -3349,6 +3373,25 @@ class GeminiLiveWorker(QThread):
                         f"Cota esgotada ({self.quedas_por_cota}a vez). "
                         f"Decisao: {decisao}."
                     )
+
+                    if decisao == "parar" and self.pode_trocar_para_alternativa():
+                        self.usando_alternativa = True
+                        self.quedas_por_cota = 0
+
+                        self.registrar_diagnostico(
+                            "Cota do Gemini esgotada: passando para a "
+                            "alternativa de voz (OpenAI Realtime)."
+                        )
+                        self.status_recebido.emit(
+                            "A cota do Gemini acabou. Continuando pela voz "
+                            "alternativa da OpenAI. "
+                            "Nela eu não enxergo a tela. "
+                            "Análise de imagem e clique visual ficam "
+                            "indisponíveis até a cota do Gemini voltar."
+                        )
+                        self.solicitou_reconexao.emit()
+                        await asyncio.sleep(1.0)
+                        continue
 
                     if decisao == "parar":
                         self.erro_recebido.emit(detalhe)
@@ -5560,6 +5603,17 @@ class GeminiLiveWorker(QThread):
             or "429" in texto
             or "quota" in texto
         )
+
+    def pode_trocar_para_alternativa(self):
+        """
+        Diz se ainda há para onde ir quando a cota do Gemini acaba.
+
+        Sem OPENAI_API_KEY no .env não há alternativa, e o ALF encerra
+        com a explicação de sempre. Uma vez trocado, não volta: o que
+        esgotou foi justamente a cota do Gemini.
+        """
+
+        return bool(OPENAI_API_KEY) and not self.usando_alternativa
 
     def decidir_apos_cota(self, duracao_sessao):
         """

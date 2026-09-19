@@ -55,6 +55,20 @@ EMAIL_SMTP_PORTA = os.getenv("EMAIL_SMTP_PORTA")
 GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
 # ============================================================
+# ALTERNATIVA DE VOZ — usada quando a cota do Gemini acaba
+# ============================================================
+#
+# Em 18/09/2026 a cota do Gemini esgotou no meio da manhã e o ALF parou:
+# um provedor só, sem para onde ir. Com OPENAI_API_KEY preenchida no
+# .env, ele passa para a API Realtime da OpenAI em vez de encerrar.
+#
+# Sem a chave, nada muda: ele continua encerrando com a explicação de
+# sempre. Nesta alternativa ele NÃO enxerga a tela; a visão é do Gemini.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+
+# ============================================================
 # MODELOS DISPONÍVEIS PARA TESTE
 # ============================================================
 #MODELO = "gemini-2.5-flash-native-audio-preview-12-2025"
