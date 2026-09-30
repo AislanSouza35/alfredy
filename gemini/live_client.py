@@ -460,6 +460,10 @@ class GeminiLiveWorker(QThread):
         # Última vez que o microfone ouviu voz de verdade. É daqui que
         # sai a medida de quanto o ALF demora para responder.
         self.momento_ultima_voz = None
+        # Vezes que a placa de som pediu áudio e não havia. É o picote,
+        # e é diferente de a fala ter sido cortada por interrupção --
+        # os dois soam parecido para quem ouve.
+        self.faltas_de_audio = 0
         # Guardará o loop assíncrono desta thread.
         self.loop = None
         # Limpa a referência da sessão encerrada.
@@ -3773,6 +3777,20 @@ class GeminiLiveWorker(QThread):
                     None,
                 )
 
+                # O servidor avisa quando decide que o usuário falou por
+                # cima e para de gerar. Sem descartar o que já chegou, o
+                # ALF continuava tocando a fala velha enquanto a nova
+                # começava: a voz saía picotada, como se cortasse.
+                if server_content and getattr(
+                    server_content, "interrupted", False
+                ):
+                    self.buffer_audio.limpar()
+                    self.limpar_fila_saida()
+                    self.registrar_diagnostico(
+                        "Turno interrompido: descartei o audio que ainda "
+                        "nao tinha tocado."
+                    )
+
                 if (
                     server_content
                     and getattr(
@@ -3783,6 +3801,15 @@ class GeminiLiveWorker(QThread):
                 ):
                     # Libera novamente o áudio quando o turno termina.
                     self.silenciar_audio_ate_fim_turno = False
+
+                    if self.faltas_de_audio:
+                        self.registrar_diagnostico(
+                            f"Audio faltou {self.faltas_de_audio} vezes "
+                            "neste turno: a placa pediu som e o buffer "
+                            "estava vazio."
+                        )
+                        self.faltas_de_audio = 0
+
                     self.agendar_liberacao_microfone()
 
     # Coloca a ferramenta pedida pelo modelo para rodar em segundo plano.
@@ -5419,6 +5446,11 @@ class GeminiLiveWorker(QThread):
             pedaco = buffer.retirar(necessario)
 
             if len(pedaco) < necessario:
+                # Só conta como falta se era para estar falando: com o
+                # ALF calado, o buffer vazio é o estado normal.
+                if self.alfred_falando:
+                    self.faltas_de_audio += 1
+
                 saida_bruta[: len(pedaco)] = pedaco
                 saida_bruta[len(pedaco):] = b"\x00" * (necessario - len(pedaco))
             else:
@@ -5490,6 +5522,18 @@ class GeminiLiveWorker(QThread):
             )
 
         return bytes(juntado)
+
+    def limpar_fila_saida(self):
+        """Joga fora o áudio que ainda não tocou."""
+
+        if self.fila_saida is None:
+            return
+
+        while True:
+            try:
+                self.fila_saida.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
     @staticmethod
     def limpar_fila_microfone(
