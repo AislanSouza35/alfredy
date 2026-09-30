@@ -935,7 +935,7 @@ def test_silenciamento_nao_atravessa_a_reconexao():
 
     # O zeramento precisa estar no bloco que a abertura da sessão roda,
     # ao lado dos outros sinalizadores que a queda pode ter travado.
-    inicio = codigo.index("Sessao Gemini Live aberta com sucesso")
+    inicio = codigo.index("Sessao aberta com sucesso")
     bloco = codigo[inicio - 1500:inicio]
 
     assert "self.alfred_falando = False" in bloco

@@ -3166,27 +3166,29 @@ class GeminiLiveWorker(QThread):
             fila_saida = asyncio.Queue()
 
             # Emite uma mensagem para a interface.
+            provedor_atual = self.nome_do_provedor()
+
             if primeira_conexao:
                 self.status_recebido.emit(
-                    "Conectando ao Gemini Live..."
+                    f"Conectando ({provedor_atual})..."
                 )
                 self.registrar_diagnostico(
-                    "Abrindo sessao Gemini Live..."
+                    f"Abrindo sessao: {provedor_atual}."
                 )
             elif tentativas_reconexao == 0:
                 self.status_recebido.emit(
                     "Renovando a conexão. A conversa continua."
                 )
                 self.registrar_diagnostico(
-                    "Renovacao normal da sessao Gemini Live."
+                    f"Renovacao normal da sessao: {provedor_atual}."
                 )
             else:
                 self.status_recebido.emit(
-                    f"Reconectando ao Gemini Live... "
+                    f"Reconectando ({provedor_atual})... "
                     f"(tentativa {tentativas_reconexao}/{MAX_TENTATIVAS_RECONEXAO})"
                 )
                 self.registrar_diagnostico(
-                    "Reabrindo sessao Gemini Live "
+                    f"Reabrindo sessao: {provedor_atual}, "
                     f"tentativa={tentativas_reconexao}"
                 )
 
@@ -3259,7 +3261,7 @@ class GeminiLiveWorker(QThread):
                         "ALF conectado. Pode falar."
                     )
                     self.registrar_diagnostico(
-                        "Sessao Gemini Live aberta com sucesso."
+                        f"Sessao aberta com sucesso: {provedor_atual}."
                     )
 
                     # Só a primeira conexão da chamada abre a conversa.
@@ -3497,7 +3499,8 @@ class GeminiLiveWorker(QThread):
                     f"Reconectando em {espera:.0f}s..."
                 )
                 self.registrar_diagnostico(
-                    f"Conexao perdida. tentativa={tentativas_reconexao} "
+                    f"Conexao perdida em {self.nome_do_provedor()}. "
+                    f"tentativa={tentativas_reconexao} "
                     f"erro={repr(erro)}\n{traceback.format_exc()}"
                 )
 
@@ -5724,6 +5727,22 @@ class GeminiLiveWorker(QThread):
                 return degrau
 
         return None
+
+    def nome_do_provedor(self):
+        """
+        Como o degrau atual aparece no log e na tela.
+
+        O log dizia "Sessao Gemini Live aberta" mesmo quando a sessão era
+        da OpenAI ou do modo simples. Na prática isso mandou o professor
+        investigar a cota do Gemini por causa de um erro que era da
+        OpenAI.
+        """
+
+        return {
+            "gemini": "Gemini Live",
+            "openai": "OpenAI Realtime",
+            "simples": "modo simples",
+        }.get(self.provedor, self.provedor)
 
     @staticmethod
     def aviso_do_provedor(provedor):

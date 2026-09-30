@@ -131,3 +131,31 @@ def test_a_conexao_abre_o_degrau_da_vez():
     assert 'elif self.provedor == "openai":' in CODIGO
     assert "conectar_simples(" in CODIGO
     assert "conectar_alternativa(" in CODIGO
+
+
+# ============================================================
+# O log precisa dizer de qual provedor fala
+# ============================================================
+
+def test_o_log_nomeia_o_provedor_da_vez():
+    """
+    O log dizia "Sessao Gemini Live aberta" mesmo quando a sessão era da
+    OpenAI. Isso mandou o professor investigar a cota do Gemini por
+    causa de um erro que era da OpenAI.
+    """
+    worker = GeminiLiveWorker()
+
+    assert worker.nome_do_provedor() == "Gemini Live"
+
+    worker.provedor = "openai"
+    assert worker.nome_do_provedor() == "OpenAI Realtime"
+
+    worker.provedor = "simples"
+    assert worker.nome_do_provedor() == "modo simples"
+
+
+def test_nenhuma_mensagem_fixa_fala_em_gemini():
+    """Mensagem de conexão com provedor fixo no texto é armadilha."""
+    assert "Abrindo sessao Gemini Live" not in CODIGO
+    assert "Reabrindo sessao Gemini Live" not in CODIGO
+    assert "Sessao Gemini Live aberta com sucesso" not in CODIGO
