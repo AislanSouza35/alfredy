@@ -351,15 +351,32 @@ class SessaoOpenAIRealtime:
 # ============================================================
 
 def montar_configuracao(instrucao, ferramentas, voz):
+    """
+    Configuração no formato definitivo da Realtime.
+
+    A primeira versão usava o formato beta, com o cabeçalho
+    OpenAI-Beta e os campos soltos na raiz da sessão. Esta conta
+    recusou com "beta_api_shape_disabled": o formato beta está
+    desligado. No definitivo, áudio de entrada e de saída ficam
+    aninhados, cada um com a sua taxa.
+    """
+
     return {
         "type": "session.update",
         "session": {
+            "type": "realtime",
             "instructions": instrucao,
-            "voice": voz,
-            "modalities": ["audio", "text"],
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "turn_detection": {"type": "server_vad"},
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": TAXA_OPENAI},
+                    "turn_detection": {"type": "server_vad"},
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": TAXA_OPENAI},
+                    "voice": voz,
+                },
+            },
             "tools": converter_ferramentas(ferramentas),
             "tool_choice": "auto",
         },
@@ -386,10 +403,9 @@ async def conectar(api_key, modelo, instrucao, ferramentas, voz, abrir=None):
     conexao = await asyncio.wait_for(
         abrir(
             f"{ENDERECO}?model={modelo}",
-            additional_headers={
-                "Authorization": f"Bearer {api_key}",
-                "OpenAI-Beta": "realtime=v1",
-            },
+            # Sem cabeçalho beta: esta conta só aceita o formato
+            # definitivo, e o beta responde beta_api_shape_disabled.
+            additional_headers={"Authorization": f"Bearer {api_key}"},
             ssl=criar_contexto_ssl_gemini(),
             max_size=None,
         ),

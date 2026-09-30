@@ -313,12 +313,28 @@ def test_sem_chave_a_alternativa_avisa_em_vez_de_travar():
     asyncio.run(executar())
 
 
-def test_configuracao_pede_deteccao_de_fala_no_servidor():
+def test_configuracao_usa_o_formato_definitivo():
+    """
+    O formato beta foi recusado por esta conta com
+    "beta_api_shape_disabled". No definitivo, entrada e saída de áudio
+    ficam aninhadas, cada uma com a sua taxa.
+    """
     config = alt.montar_configuracao("instrução", [_ferramenta()], "alloy")["session"]
 
-    assert config["turn_detection"] == {"type": "server_vad"}
-    assert config["input_audio_format"] == "pcm16"
-    assert config["output_audio_format"] == "pcm16"
+    assert config["type"] == "realtime"
     assert config["instructions"] == "instrução"
-    assert config["voice"] == "alloy"
+    assert config["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
+    assert config["audio"]["input"]["format"]["rate"] == alt.TAXA_OPENAI
+    assert config["audio"]["output"]["voice"] == "alloy"
+    assert config["audio"]["output"]["format"]["type"] == "audio/pcm"
     assert len(config["tools"]) == 1
+
+
+def test_nao_manda_o_cabecalho_beta():
+    from pathlib import Path
+
+    codigo = Path("voz/openai_realtime.py").read_text(encoding="utf-8")
+
+    # Citar o nome ao explicar por que ele saiu é diferente de enviá-lo:
+    # o que não pode existir é a chave do cabeçalho, entre aspas.
+    assert chr(34) + 'OpenAI-Beta' + chr(34) not in codigo
