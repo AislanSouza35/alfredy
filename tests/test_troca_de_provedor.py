@@ -1,15 +1,17 @@
 """
-A troca de provedor quando a cota do Gemini acaba.
+A cadeia de voz: Gemini Live, OpenAI Realtime e o modo simples.
 
-Em 18/09/2026 a cota esgotou no meio da manhã e o ALF parou de vez: um
-provedor só, sem para onde ir. O JARVIS, na mesma máquina, atravessa
-isso porque tem uma cadeia de alternativas.
+Em 18/09/2026 a cota do Gemini esgotou no meio da manhã e o ALF parou de
+vez: um provedor só, sem para onde ir. O JARVIS, na mesma máquina,
+atravessa isso porque mantém uma cadeia de alternativas.
 
-Aqui fica travado o comportamento da troca -- inclusive o caso de não
-haver alternativa configurada, que continua encerrando com explicação.
+A cadeia só desce. O que esgotou foi a cota do degrau anterior, e voltar
+a ele gastaria o que não tem.
 """
 
 from pathlib import Path
+
+import pytest
 
 import gemini.live_client as live_client
 from gemini.live_client import GeminiLiveWorker
@@ -18,47 +20,102 @@ from gemini.live_client import GeminiLiveWorker
 CODIGO = Path("gemini/live_client.py").read_text(encoding="utf-8")
 
 
-def test_com_chave_da_openai_existe_para_onde_ir(monkeypatch):
-    monkeypatch.setattr(live_client, "OPENAI_API_KEY", "sk-exemplo")
+@pytest.fixture
+def chaves(monkeypatch):
+    """Cada teste diz quais chaves existem."""
+
+    def definir(openai="sk-openai", groq="gsk", mistral="", cerebras=""):
+        monkeypatch.setattr(live_client, "OPENAI_API_KEY", openai)
+        monkeypatch.setattr(live_client, "GROQ_API_KEY", groq)
+        monkeypatch.setattr(live_client, "MISTRAL_API_KEY", mistral)
+        monkeypatch.setattr(live_client, "CEREBRAS_API_KEY", cerebras)
+
+    return definir
+
+
+def test_do_gemini_desce_para_a_openai(chaves):
+    chaves()
+
+    assert GeminiLiveWorker().proximo_provedor() == "openai"
+
+
+def test_sem_openai_pula_direto_para_o_modo_simples(chaves):
+    """Faltar um degrau não pode quebrar a cadeia."""
+    chaves(openai="")
+
+    assert GeminiLiveWorker().proximo_provedor() == "simples"
+
+
+def test_da_openai_desce_para_o_modo_simples(chaves):
+    chaves()
     worker = GeminiLiveWorker()
+    worker.provedor = "openai"
 
-    assert worker.pode_trocar_para_alternativa()
+    assert worker.proximo_provedor() == "simples"
 
 
-def test_sem_chave_nao_ha_alternativa(monkeypatch):
-    """Sem OPENAI_API_KEY ele encerra com a explicação de sempre."""
-    monkeypatch.setattr(live_client, "OPENAI_API_KEY", None)
+def test_do_modo_simples_nao_ha_mais_para_onde_ir(chaves):
+    chaves()
     worker = GeminiLiveWorker()
+    worker.provedor = "simples"
 
-    assert not worker.pode_trocar_para_alternativa()
+    assert worker.proximo_provedor() is None
 
 
-def test_nao_troca_duas_vezes(monkeypatch):
-    """O que esgotou foi a cota do Gemini: voltar só gastaria de novo."""
-    monkeypatch.setattr(live_client, "OPENAI_API_KEY", "sk-exemplo")
-    worker = GeminiLiveWorker()
-    worker.usando_alternativa = True
+def test_sem_nenhuma_chave_extra_o_alf_encerra_explicando(chaves):
+    chaves(openai="", groq="")
 
-    assert not worker.pode_trocar_para_alternativa()
+    assert GeminiLiveWorker().proximo_provedor() is None
+
+
+def test_qualquer_provedor_de_texto_habilita_o_modo_simples(chaves):
+    """Groq, Mistral ou Cerebras: basta um."""
+    chaves(openai="", groq="", mistral="chave-mistral")
+    assert GeminiLiveWorker().proximo_provedor() == "simples"
+
+    chaves(openai="", groq="", mistral="", cerebras="chave-cerebras")
+    assert GeminiLiveWorker().proximo_provedor() == "simples"
 
 
 def test_a_chamada_comeca_sempre_pelo_gemini():
-    assert GeminiLiveWorker().usando_alternativa is False
+    assert GeminiLiveWorker().provedor == "gemini"
 
+
+# ============================================================
+# O que o professor ouve
+# ============================================================
+
+def test_o_aviso_da_openai_diz_o_que_deixa_de_funcionar():
+    aviso = GeminiLiveWorker.aviso_do_provedor("openai")
+
+    assert "não enxergo a tela" in aviso
+    assert "clique visual" in aviso
+
+
+def test_o_aviso_do_modo_simples_avisa_do_que_muda():
+    """É mais devagar e não dá para interromper: melhor saber antes."""
+    aviso = GeminiLiveWorker.aviso_do_provedor("simples")
+
+    assert "modo simples" in aviso
+    assert "devagar" in aviso
+    assert "interromper" in aviso
+    assert "demais funções seguem funcionando" in aviso
+
+
+# ============================================================
+# A ligação com o laço de conexão
+# ============================================================
 
 def test_a_troca_acontece_na_primeira_recusa():
     """
-    Esperar dois minutos em silêncio por uma cota que acabou, com outro
-    provedor pronto ao lado, é tempo de aula jogado fora. A checagem da
-    alternativa vem ANTES da decisão de esperar.
+    Esperar em silêncio por uma cota que acabou, com outro provedor
+    pronto ao lado, é tempo de aula jogado fora.
     """
     trecho = CODIGO.split("if self.parece_cota_esgotada(erro):", 1)[1][:2500]
 
-    posicao_troca = trecho.index("pode_trocar_para_alternativa()")
-    posicao_espera = trecho.index("decidir_apos_cota(duracao_sessao)")
-
-    assert posicao_troca < posicao_espera
-    assert "usando_alternativa = True" in trecho
+    assert trecho.index("proximo_provedor()") < trecho.index(
+        "decidir_apos_cota(duracao_sessao)"
+    )
 
 
 def test_sem_alternativa_continua_esperando_antes_de_encerrar():
@@ -69,18 +126,8 @@ def test_sem_alternativa_continua_esperando_antes_de_encerrar():
     assert "raise RuntimeError(detalhe)" in trecho
 
 
-def test_o_usuario_e_avisado_do_que_deixa_de_funcionar():
-    """Na alternativa ele não enxerga a tela; fingir seria pior."""
-    assert "não enxergo a tela" in CODIGO
-    assert "clique visual" in CODIGO
-
-
-def test_a_conexao_escolhe_o_provedor_da_vez():
-    assert "if self.usando_alternativa:" in CODIGO
+def test_a_conexao_abre_o_degrau_da_vez():
+    assert 'if self.provedor == "simples":' in CODIGO
+    assert 'elif self.provedor == "openai":' in CODIGO
+    assert "conectar_simples(" in CODIGO
     assert "conectar_alternativa(" in CODIGO
-
-
-def test_a_instrucao_vai_para_os_dois_provedores():
-    """A alternativa recebe a mesma instrução, com memórias e data."""
-    assert "instrucao_agora = self.atualizar_instrucao_sistema(" in CODIGO
-    assert "instrucao_agora," in CODIGO

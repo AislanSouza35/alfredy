@@ -20,16 +20,16 @@ def test_sem_a_variavel_comeca_pelo_gemini(monkeypatch):
     monkeypatch.setattr(live_client, "FORCAR_VOZ_ALTERNATIVA", False)
     monkeypatch.setattr(live_client, "OPENAI_API_KEY", "sk-exemplo")
 
-    assert GeminiLiveWorker.decidir_provedor_inicial() == (False, "")
+    assert GeminiLiveWorker.decidir_provedor_inicial() == ("gemini", "")
 
 
 def test_com_a_variavel_comeca_pela_alternativa(monkeypatch):
     monkeypatch.setattr(live_client, "FORCAR_VOZ_ALTERNATIVA", True)
     monkeypatch.setattr(live_client, "OPENAI_API_KEY", "sk-exemplo")
 
-    usar, mensagem = GeminiLiveWorker.decidir_provedor_inicial()
+    degrau, mensagem = GeminiLiveWorker.decidir_provedor_inicial()
 
-    assert usar
+    assert degrau == "openai"
     # Ninguém deveria descobrir por acaso que está falando com outro
     # provedor, nem esquecer a variável ligada.
     assert "ALF_VOZ_ALTERNATIVA" in mensagem
@@ -42,9 +42,9 @@ def test_forcada_sem_chave_avisa_e_segue_no_gemini(monkeypatch):
     monkeypatch.setattr(live_client, "FORCAR_VOZ_ALTERNATIVA", True)
     monkeypatch.setattr(live_client, "OPENAI_API_KEY", None)
 
-    usar, mensagem = GeminiLiveWorker.decidir_provedor_inicial()
+    degrau, mensagem = GeminiLiveWorker.decidir_provedor_inicial()
 
-    assert not usar
+    assert degrau == "gemini"
     assert "falta OPENAI_API_KEY" in mensagem
     assert "Continuando pelo Gemini" in mensagem
 
@@ -68,4 +68,4 @@ def test_a_variavel_aceita_as_formas_comuns():
 
 
 def test_a_decisao_acontece_na_abertura_da_chamada():
-    assert "self.usando_alternativa, aviso_provedor = self.decidir_provedor_inicial()" in CODIGO
+    assert "self.provedor, aviso_provedor = self.decidir_provedor_inicial()" in CODIGO

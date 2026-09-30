@@ -82,6 +82,27 @@ OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 
 # ============================================================
+# ÚLTIMO RECURSO — o modo simples
+# ============================================================
+#
+# Terceiro degrau da cadeia, para quando Gemini e OpenAI recusarem.
+# Groq, Mistral e Cerebras não têm voz em tempo real: aqui o ALF ouve
+# até o silêncio, transcreve, responde em texto e fala pela voz do
+# Windows. Mais lento e sem interrupção no meio da fala, mas funciona --
+# e a fala não depende de cota nenhuma.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+
+GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
+MISTRAL_CHAT_MODEL = os.getenv("MISTRAL_CHAT_MODEL", "mistral-large-latest")
+CEREBRAS_CHAT_MODEL = os.getenv("CEREBRAS_CHAT_MODEL", "llama-3.3-70b")
+
+# Voz do Windows usada no modo simples. Esta máquina tem a Maria, pt-BR.
+VOZ_WINDOWS = os.getenv("VOZ_WINDOWS", "Microsoft Maria Desktop")
+
+# ============================================================
 # MODELOS DISPONÍVEIS PARA TESTE
 # ============================================================
 #MODELO = "gemini-2.5-flash-native-audio-preview-12-2025"

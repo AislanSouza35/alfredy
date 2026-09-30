@@ -57,15 +57,27 @@ from core.config import (
     GEMINI_API_KEY,
     GEMINI_LIVE_MODEL,
     GEMINI_VOICE,
+    CEREBRAS_API_KEY,
+    CEREBRAS_CHAT_MODEL,
     FORCAR_VOZ_ALTERNATIVA,
+    GROQ_API_KEY,
+    GROQ_CHAT_MODEL,
+    GROQ_WHISPER_MODEL,
+    MISTRAL_API_KEY,
+    MISTRAL_CHAT_MODEL,
     OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_VOICE,
+    VOZ_WINDOWS,
 )
 
 # Alternativa para quando a cota do Gemini acaba. Ela tem a mesma cara
 # da sessão do Gemini, então o laço de recebimento não muda.
 from voz.openai_realtime import conectar as conectar_alternativa
+
+# Último degrau: sem voz em tempo real, ouvindo até o silêncio e falando
+# pela voz do Windows. Ver voz/modo_simples.py.
+from voz.modo_simples import Provedor, conectar_simples
 from core.memoria import memoria_apertada
 from core.gemini_ssl import (
     criar_contexto_ssl_gemini,
@@ -442,9 +454,9 @@ class GeminiLiveWorker(QThread):
         self.memoria_apertada = False
         # Quedas seguidas por cota esgotada da chave do Gemini.
         self.quedas_por_cota = 0
-        # True depois de passar para a alternativa de voz, até o fim da
-        # chamada: voltar sozinho para o Gemini só gastaria cota de novo.
-        self.usando_alternativa = False
+        # Degrau atual da cadeia de voz: "gemini", "openai" ou "simples".
+        # Só desce, e só até o fim da chamada.
+        self.provedor = "gemini"
         # Última vez que o microfone ouviu voz de verdade. É daqui que
         # sai a medida de quanto o ALF demora para responder.
         self.momento_ultima_voz = None
@@ -2475,7 +2487,7 @@ class GeminiLiveWorker(QThread):
 
         self.avisar_se_memoria_apertada()
 
-        self.usando_alternativa, aviso_provedor = self.decidir_provedor_inicial()
+        self.provedor, aviso_provedor = self.decidir_provedor_inicial()
         if aviso_provedor:
             self.status_recebido.emit(aviso_provedor)
             self.registrar_diagnostico(aviso_provedor)
@@ -3181,7 +3193,16 @@ class GeminiLiveWorker(QThread):
             try:
                 # Abre a sessão Live com limite para não deixar a interface
                 # presa indefinidamente enquanto a rede ou a API não responde.
-                if self.usando_alternativa:
+                if self.provedor == "simples":
+                    gerenciador_conexao = conectar_simples(
+                        instrucao_agora,
+                        tools,
+                        self.provedores_de_texto(),
+                        GROQ_API_KEY,
+                        GROQ_WHISPER_MODEL,
+                        VOZ_WINDOWS,
+                    )
+                elif self.provedor == "openai":
                     # Mesma superfície da sessão do Gemini: o laço de
                     # recebimento, o microfone e as ferramentas seguem
                     # iguais. Ver voz/openai_realtime.py.
@@ -3390,21 +3411,18 @@ class GeminiLiveWorker(QThread):
                     # Esperar dois minutos em silêncio por uma cota que
                     # acabou, com outro provedor pronto ao lado, é tempo
                     # de aula jogado fora.
-                    if self.pode_trocar_para_alternativa():
-                        self.usando_alternativa = True
+                    proximo = self.proximo_provedor()
+
+                    if proximo is not None:
+                        anterior = self.provedor
+                        self.provedor = proximo
                         self.quedas_por_cota = 0
 
                         self.registrar_diagnostico(
-                            "Cota do Gemini esgotada: passando para a "
-                            "alternativa de voz (OpenAI Realtime)."
+                            f"Cota esgotada em {anterior}: descendo para "
+                            f"{proximo}."
                         )
-                        self.status_recebido.emit(
-                            "A cota do Gemini acabou. Continuando pela voz "
-                            "alternativa da OpenAI. "
-                            "Nela eu não enxergo a tela. "
-                            "Análise de imagem e clique visual ficam "
-                            "indisponíveis até a cota do Gemini voltar."
-                        )
+                        self.status_recebido.emit(self.aviso_do_provedor(proximo))
                         self.solicitou_reconexao.emit()
                         await asyncio.sleep(1.0)
                         continue
@@ -5640,7 +5658,7 @@ class GeminiLiveWorker(QThread):
         """
         Diz por qual provedor a chamada começa.
 
-        Devolve (usar_alternativa, mensagem). A mensagem é vazia no caso
+        Devolve (degrau, mensagem). A mensagem é vazia no caso
         normal; quando a alternativa é forçada, ela avisa -- ninguém
         deveria descobrir por acaso que está falando com outro provedor.
 
@@ -5649,31 +5667,82 @@ class GeminiLiveWorker(QThread):
         """
 
         if not FORCAR_VOZ_ALTERNATIVA:
-            return False, ""
+            return "gemini", ""
 
         if not OPENAI_API_KEY:
-            return False, (
+            return "gemini", (
                 "ALF_VOZ_ALTERNATIVA está ligada, mas falta OPENAI_API_KEY "
                 "no .env. Continuando pelo Gemini."
             )
 
-        return True, (
+        return "openai", (
             "Alternativa de voz ligada por configuração "
             "(ALF_VOZ_ALTERNATIVA): esta chamada usa a OpenAI, não o "
             "Gemini. Nela eu não enxergo a tela. "
             "Para voltar ao normal, apague essa linha do .env."
         )
 
-    def pode_trocar_para_alternativa(self):
-        """
-        Diz se ainda há para onde ir quando a cota do Gemini acaba.
+    @staticmethod
+    def provedores_de_texto():
+        """Os serviços de texto do último degrau, na ordem de tentativa."""
 
-        Sem OPENAI_API_KEY no .env não há alternativa, e o ALF encerra
-        com a explicação de sempre. Uma vez trocado, não volta: o que
-        esgotou foi justamente a cota do Gemini.
+        return [
+            Provedor(
+                "groq", "https://api.groq.com/openai/v1",
+                GROQ_API_KEY, GROQ_CHAT_MODEL,
+            ),
+            Provedor(
+                "mistral", "https://api.mistral.ai/v1",
+                MISTRAL_API_KEY, MISTRAL_CHAT_MODEL,
+            ),
+            Provedor(
+                "cerebras", "https://api.cerebras.ai/v1",
+                CEREBRAS_API_KEY, CEREBRAS_CHAT_MODEL,
+            ),
+        ]
+
+    def proximo_provedor(self):
+        """
+        O próximo degrau da cadeia, ou None quando não há mais.
+
+        Três degraus: Gemini Live, OpenAI Realtime e o modo simples. A
+        cadeia só desce -- o que esgotou foi a cota do degrau anterior,
+        e voltar a ele gastaria o que não tem.
         """
 
-        return bool(OPENAI_API_KEY) and not self.usando_alternativa
+        degraus = ["gemini", "openai", "simples"]
+
+        disponivel = {
+            "openai": bool(OPENAI_API_KEY),
+            "simples": any(p.disponivel() for p in self.provedores_de_texto()),
+        }
+
+        atual = degraus.index(self.provedor) if self.provedor in degraus else 0
+
+        for degrau in degraus[atual + 1:]:
+            if disponivel.get(degrau):
+                return degrau
+
+        return None
+
+    @staticmethod
+    def aviso_do_provedor(provedor):
+        if provedor == "openai":
+            return (
+                "A cota do Gemini acabou. Continuando pela voz alternativa "
+                "da OpenAI. "
+                "Nela eu não enxergo a tela. "
+                "Análise de imagem e clique visual ficam indisponíveis até "
+                "a cota do Gemini voltar."
+            )
+
+        return (
+            "As duas vozes em tempo real recusaram por cota. Continuando no "
+            "modo simples: eu ouço, respondo e falo pela voz do Windows. "
+            "É mais devagar, você não consegue me interromper no meio da "
+            "fala, e eu continuo sem enxergar a tela. "
+            "As demais funções seguem funcionando."
+        )
 
     def decidir_apos_cota(self, duracao_sessao):
         """
