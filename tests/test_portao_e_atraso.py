@@ -60,12 +60,20 @@ def test_conta_a_partir_da_voz_do_usuario_e_nao_do_turno_anterior():
     usuário virava lentidão do ALF: apareceram "demoras" de 38 s e 94 s
     que eram só ele pensando antes de falar.
     """
-    from pathlib import Path
+    import gemini.live_client as live_client
 
-    codigo = Path("gemini/live_client.py").read_text(encoding="utf-8")
+    worker = GeminiLiveWorker()
 
-    assert "self.momento_ultima_voz = time.monotonic()" in codigo
-    assert "nivel_microfone >= LIMIAR_VOZ_MICROFONE" in codigo
+    # Silêncio não mexe no relógio; voz mexe.
+    worker.decidir_envio_do_microfone(
+        live_client.LIMIAR_VOZ_MICROFONE - 0.02, agora=500.0
+    )
+    assert worker.momento_ultima_voz is None
+
+    worker.decidir_envio_do_microfone(
+        live_client.LIMIAR_VOZ_MICROFONE + 0.05, agora=500.0
+    )
+    assert worker.momento_ultima_voz == 500.0
 
 
 def test_mede_quanto_tempo_levou_para_responder():

@@ -6,6 +6,7 @@
 # - chamadas de ferramentas;
 # - encerramento controlado da sessão.
 import asyncio
+from collections import deque
 import random
 import re
 import sys
@@ -316,6 +317,11 @@ LIMIAR_VOZ_MICROFONE = 0.045
 
 # Tempo de silêncio após fala para finalizar o turno de áudio.
 TEMPO_SILENCIO_FINALIZAR_AUDIO = 0.9
+
+# Quanto do áudio anterior à primeira sílaba vai junto quando a fala
+# começa. Sem isso o começo da palavra se perde, porque o nível só passa
+# do limiar depois que a voz já saiu.
+PRE_ROLO_SEGUNDOS = 0.4
 
 # Tempo mínimo para considerar que uma sessão reconectada ficou estável.
 TEMPO_SESSAO_ESTAVEL = 45.0
@@ -3627,6 +3633,12 @@ class GeminiLiveWorker(QThread):
                 adicionar_audio
             )
 
+        # Guarda os últimos blocos de silêncio, para que o começo da
+        # fala não se perca quando o nível finalmente passa do limiar.
+        pre_rolo = deque(
+            maxlen=max(1, int(PRE_ROLO_SEGUNDOS * TAXA_ENTRADA / BLOCO))
+        )
+
         # Abre o fluxo bruto do microfone.
         with sd.RawInputStream(
             samplerate=TAXA_ENTRADA,
@@ -3646,27 +3658,37 @@ class GeminiLiveWorker(QThread):
                 if self.alfred_falando or self.processando_ferramenta:
                     continue
 
-                # O nível é medido sempre, e não só quando o VAD local
-                # está ligado: é ele que marca quando o usuário falou
-                # pela última vez. Sem isso, a medida de demora começava
-                # no fim do turno anterior e contava como lentidão do
-                # ALF todo o tempo em que o usuário ficou calado -- foi
-                # assim que apareceram "demoras" de 38 s e 94 s.
+                # O nível é medido sempre: é ele que marca quando o
+                # usuário falou pela última vez, e é dele que sai a
+                # medida de demora da resposta.
                 nivel_microfone = self.calcular_nivel_audio(audio_bytes)
+                decisao = self.decidir_envio_do_microfone(nivel_microfone)
 
-                if nivel_microfone >= LIMIAR_VOZ_MICROFONE:
-                    self.momento_ultima_voz = time.monotonic()
+                if decisao == "guardar":
+                    # Silêncio antes da fala: fica no pré-rolo e não sobe.
+                    pre_rolo.append(audio_bytes)
+                    continue
 
-                # Envia o bloco ao Gemini em tempo real.
+                if decisao == "encerrar":
+                    pre_rolo.clear()
+                    await self.finalizar_fluxo_audio_pendente(sessao)
+                    continue
+
+                # Começou a falar: o pré-rolo vai junto, senão o começo
+                # da palavra se perde.
+                blocos = list(pre_rolo) + [audio_bytes]
+                pre_rolo.clear()
+
                 async with self.lock_envio:
-                    await sessao.send_realtime_input(
-                        audio=types.Blob(
-                            data=audio_bytes,
-                            mime_type=(
-                                f"audio/pcm;rate={TAXA_ENTRADA}"
-                            ),
+                    for bloco in blocos:
+                        await sessao.send_realtime_input(
+                            audio=types.Blob(
+                                data=bloco,
+                                mime_type=(
+                                    f"audio/pcm;rate={TAXA_ENTRADA}"
+                                ),
+                            )
                         )
-                    )
                     self.fluxo_audio_em_andamento = True
 
                 # A Live API já detecta o fim da fala no servidor.
@@ -5845,6 +5867,43 @@ class GeminiLiveWorker(QThread):
             return 1
 
         return tentativas_atual + 1
+
+    def decidir_envio_do_microfone(self, nivel, agora=None):
+        """
+        Diz o que fazer com o bloco: "enviar", "guardar" ou "encerrar".
+
+        O ALF mandava ao servidor TUDO o que o microfone captava, desde
+        o instante em que conectava. Ruído de sala, ventilador, teclado.
+        Quando ele começava a falar e o programa fechava o fluxo com o
+        fim de fala, o servidor tratava aquele ruído acumulado como uma
+        fala do usuário -- e cortava a própria resposta para "ouvir".
+
+        Foi o que o log registrou em 30/09/2026: interrupção dois
+        segundos depois da saudação de abertura, com ninguém falando.
+
+        Agora o silêncio fica guardado aqui e só o que tem voz sobe. O
+        silêncio do FIM da fala continua sendo enviado, porque é nele
+        que o servidor percebe que a frase acabou.
+        """
+
+        if agora is None:
+            agora = time.monotonic()
+
+        if nivel >= LIMIAR_VOZ_MICROFONE:
+            self.momento_ultima_voz = agora
+            self.usuario_falando_detectado = True
+            return "enviar"
+
+        if not self.usuario_falando_detectado:
+            return "guardar"
+
+        quieto_desde = self.momento_ultima_voz or agora
+
+        if agora - quieto_desde >= TEMPO_SILENCIO_FINALIZAR_AUDIO:
+            self.usuario_falando_detectado = False
+            return "encerrar"
+
+        return "enviar"
 
     def deve_finalizar_fluxo_por_silencio(
         self,
