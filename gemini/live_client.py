@@ -554,54 +554,18 @@ class GeminiLiveWorker(QThread):
 
             self.chamada_encerrada.emit()
 
-    # Método principal da sessão.
-    # Ele configura as ferramentas, conecta ao Gemini,
-    # cria filas e inicia as tarefas de áudio.
-    async def executar(self):
-        self.registrar_diagnostico(
-            "executar() iniciado."
-        )
+    def montar_ferramentas(self):
+        """
+        As ferramentas que o modelo pode chamar.
 
-        # Verifica se a chave da API foi carregada corretamente.
-        if not GEMINI_API_KEY:
-            self.registrar_diagnostico(
-                "GEMINI_API_KEY ausente."
-            )
-            raise ValueError(
-                "GEMINI_API_KEY não encontrada no arquivo .env"
-            )
+        Ficavam escritas dentro de executar(), quase mil e novecentas
+        linhas no meio do laço de conexão. Separadas, dá para conferir
+        a lista sem abrir uma sessão -- e a alternativa de voz precisa
+        traduzi-la para o formato da OpenAI, o que só dava para testar
+        com uma cópia à parte, que divergiria na primeira pressa.
+        """
 
-        # Guarda o loop atual.
-        # Isso permite que botões da interface agendem funções assíncronas.
-        self.loop = asyncio.get_running_loop()
-        self.lock_envio = asyncio.Lock()
-        self.renovacao_em_andamento = False
-
-        self.registrar_diagnostico(
-            f"Configuracao carregada. frozen={getattr(sys, 'frozen', False)} "
-            f"modelo={GEMINI_LIVE_MODEL} voz={GEMINI_VOICE}"
-        )
-
-        self.avisar_se_memoria_apertada()
-
-        self.usando_alternativa, aviso_provedor = self.decidir_provedor_inicial()
-        if aviso_provedor:
-            self.status_recebido.emit(aviso_provedor)
-            self.registrar_diagnostico(aviso_provedor)
-
-        # Cria o cliente autenticado da API Gemini.
-        # No Windows/OpenSSL 3.5, algumas cadeias confiáveis pelo sistema
-        # falham com VERIFY_X509_STRICT. O contexto abaixo mantém a validação
-        # de certificado ativa, mas permite a cadeia usada pela rede local.
-        client = genai.Client(
-            api_key=GEMINI_API_KEY,
-            http_options=criar_http_options_gemini(types),
-        )
-
-        # Lista de ferramentas disponíveis para o modelo.
-        # O Gemini decide quando chamar cada função com base
-        # nas descrições e parâmetros fornecidos.
-        tools = [
+        return [
             types.Tool(
                 function_declarations=[
                     # Cada FunctionDeclaration descreve uma função local
@@ -2480,6 +2444,55 @@ class GeminiLiveWorker(QThread):
                 ]
             )
         ]
+
+    # Método principal da sessão.
+    # Ele configura as ferramentas, conecta ao Gemini,
+    # cria filas e inicia as tarefas de áudio.
+    async def executar(self):
+        self.registrar_diagnostico(
+            "executar() iniciado."
+        )
+
+        # Verifica se a chave da API foi carregada corretamente.
+        if not GEMINI_API_KEY:
+            self.registrar_diagnostico(
+                "GEMINI_API_KEY ausente."
+            )
+            raise ValueError(
+                "GEMINI_API_KEY não encontrada no arquivo .env"
+            )
+
+        # Guarda o loop atual.
+        # Isso permite que botões da interface agendem funções assíncronas.
+        self.loop = asyncio.get_running_loop()
+        self.lock_envio = asyncio.Lock()
+        self.renovacao_em_andamento = False
+
+        self.registrar_diagnostico(
+            f"Configuracao carregada. frozen={getattr(sys, 'frozen', False)} "
+            f"modelo={GEMINI_LIVE_MODEL} voz={GEMINI_VOICE}"
+        )
+
+        self.avisar_se_memoria_apertada()
+
+        self.usando_alternativa, aviso_provedor = self.decidir_provedor_inicial()
+        if aviso_provedor:
+            self.status_recebido.emit(aviso_provedor)
+            self.registrar_diagnostico(aviso_provedor)
+
+        # Cria o cliente autenticado da API Gemini.
+        # No Windows/OpenSSL 3.5, algumas cadeias confiáveis pelo sistema
+        # falham com VERIFY_X509_STRICT. O contexto abaixo mantém a validação
+        # de certificado ativa, mas permite a cadeia usada pela rede local.
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=criar_http_options_gemini(types),
+        )
+
+        # Lista de ferramentas disponíveis para o modelo.
+        # O Gemini decide quando chamar cada função com base
+        # nas descrições e parâmetros fornecidos.
+        tools = self.montar_ferramentas()
 
         # Carrega as memórias persistentes já salvas
         # e prepara o conteúdo para incluir no contexto inicial.

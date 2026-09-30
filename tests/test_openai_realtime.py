@@ -338,3 +338,97 @@ def test_nao_manda_o_cabecalho_beta():
     # Citar o nome ao explicar por que ele saiu é diferente de enviá-lo:
     # o que não pode existir é a chave do cabeçalho, entre aspas.
     assert chr(34) + 'OpenAI-Beta' + chr(34) not in codigo
+
+
+# ============================================================
+# O que o teste contra a API real revelou
+# ============================================================
+
+def test_a_mesma_chamada_nao_e_entregue_duas_vezes():
+    """
+    A chamada chega em dois eventos: function_call_arguments.done e
+    output_item.done. Sem filtro, a ferramenta rodava duas vezes -- e
+    lançar nota duas vezes não é diferença de detalhe.
+    """
+
+    async def executar():
+        ws = _WebSocketFalso(
+            [
+                {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "c1",
+                    "name": "estado_do_transporte",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "c1",
+                        "name": "estado_do_transporte",
+                        "arguments": "{}",
+                    },
+                },
+            ]
+        )
+        sessao = alt.SessaoOpenAIRealtime(ws)
+
+        eventos = [e async for e in sessao.receive() if e.tool_call is not None]
+
+        assert len(eventos) == 1
+
+    asyncio.run(executar())
+
+
+def test_nao_pede_resposta_no_meio_de_outra():
+    """
+    O servidor recusa: "Conversation already has an active response in
+    progress". O pedido fica guardado para quando a atual terminar.
+    """
+
+    async def executar():
+        ws = _WebSocketFalso()
+        sessao = alt.SessaoOpenAIRealtime(ws)
+        sessao._resposta_ativa = True
+
+        await sessao.send_tool_response(
+            function_responses=[
+                types.FunctionResponse(
+                    id="c1", name="estado_do_transporte", response={"result": "nada"}
+                )
+            ]
+        )
+
+        assert ws.tipos() == ["conversation.item.create"]
+        assert sessao._resposta_pendente
+
+    asyncio.run(executar())
+
+
+def test_o_pedido_guardado_sai_quando_a_resposta_termina():
+    async def executar():
+        ws = _WebSocketFalso([{"type": "response.done"}])
+        sessao = alt.SessaoOpenAIRealtime(ws)
+        sessao._resposta_ativa = True
+        sessao._resposta_pendente = True
+
+        eventos = [e async for e in sessao.receive()]
+
+        assert ws.tipos() == ["response.create"]
+        # O turno não acabou: falta o ALF dizer o resultado da ferramenta.
+        assert eventos == []
+
+    asyncio.run(executar())
+
+
+def test_turno_normal_continua_terminando():
+    async def executar():
+        ws = _WebSocketFalso([{"type": "response.created"}, {"type": "response.done"}])
+        sessao = alt.SessaoOpenAIRealtime(ws)
+
+        eventos = [e async for e in sessao.receive()]
+
+        assert len(eventos) == 1
+        assert eventos[0].server_content.turn_complete is True
+
+    asyncio.run(executar())

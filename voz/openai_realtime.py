@@ -206,6 +206,14 @@ class SessaoOpenAIRealtime:
         self._sobra_audio = None
         # call_id de cada função, para devolver o resultado no lugar certo.
         self._chamadas = {}
+        # A mesma chamada chega em dois eventos diferentes. Sem isto, a
+        # ferramenta rodava duas vezes -- e lançar nota duas vezes não é
+        # uma diferença de detalhe.
+        self._ja_entregues = set()
+        # O servidor recusa um pedido de resposta enquanto a anterior
+        # ainda corre: "Conversation already has an active response".
+        self._resposta_ativa = False
+        self._resposta_pendente = False
 
     # ---------- envio ----------
 
@@ -293,7 +301,12 @@ class SessaoOpenAIRealtime:
                 }
             )
 
-        await self._enviar({"type": "response.create"})
+        # O resultado pode ser entregue a qualquer momento, mas pedir a
+        # fala seguinte no meio de uma resposta em curso é recusado.
+        if self._resposta_ativa:
+            self._resposta_pendente = True
+        else:
+            await self._enviar({"type": "response.create"})
 
     # ---------- recebimento ----------
 
@@ -302,7 +315,10 @@ class SessaoOpenAIRealtime:
             evento = json.loads(bruto)
             tipo = evento.get("type", "")
 
-            if tipo == "response.audio.delta" or tipo == "response.output_audio.delta":
+            if tipo == "response.created":
+                self._resposta_ativa = True
+
+            elif tipo == "response.audio.delta" or tipo == "response.output_audio.delta":
                 yield Evento(data=base64.b64decode(evento.get("delta", "")))
 
             elif tipo in (
@@ -314,7 +330,15 @@ class SessaoOpenAIRealtime:
                     yield Evento(tool_call=_ListaDeChamadas([chamada]))
 
             elif tipo == "response.done":
-                yield Evento(server_content=_TurnoTerminou())
+                self._resposta_ativa = False
+
+                if self._resposta_pendente:
+                    # A resposta que acabou era a da chamada de função. O
+                    # turno não terminou: falta o ALF dizer o resultado.
+                    self._resposta_pendente = False
+                    await self._enviar({"type": "response.create"})
+                else:
+                    yield Evento(server_content=_TurnoTerminou())
 
             elif tipo == "error":
                 detalhe = evento.get("error", {}) or {}
@@ -334,6 +358,13 @@ class SessaoOpenAIRealtime:
             return None
 
         id_chamada = evento.get("call_id") or item.get("call_id") or ""
+
+        # A mesma chamada vem em response.function_call_arguments.done e
+        # de novo em response.output_item.done.
+        if id_chamada in self._ja_entregues:
+            return None
+        self._ja_entregues.add(id_chamada)
+
         argumentos = evento.get("arguments") or item.get("arguments") or "{}"
 
         try:
