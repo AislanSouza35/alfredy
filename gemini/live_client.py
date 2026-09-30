@@ -5617,13 +5617,19 @@ class GeminiLiveWorker(QThread):
         A Live API fecha com 1011 "Resource has been exhausted"; o resto
         da API usa 429 / RESOURCE_EXHAUSTED. Nenhum deles se resolve
         reconectando: só o tempo resolve.
+
+        O número 1011 sozinho NÃO basta. O mesmo código também fecha com
+        "Internal error encountered", que é falha passageira do servidor
+        e se resolve reconectando. No histórico desta máquina eram 46 de
+        um tipo contra 47 do outro: tratar os dois como cota faria o ALF
+        esperar um minuto e depois anunciar uma cota esgotada que não
+        tinha acabado.
         """
 
         texto = str(erro).lower()
 
         return (
-            "1011" in texto
-            or "resource has been exhausted" in texto
+            "resource has been exhausted" in texto
             or "resource_exhausted" in texto
             or "429" in texto
             or "quota" in texto

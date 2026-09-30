@@ -32,6 +32,11 @@ def test_reconhece_recusa_por_cota(erro):
     "erro",
     [
         "1008 None. The operation was aborted.",
+        # Mesmo código 1011, outro problema: falha passageira do
+        # servidor, que se resolve reconectando. Metade das quedas 1011
+        # desta máquina eram assim.
+        "received 1011 (internal error) Internal error encountered.",
+        "1011 None. Internal error encountered.",
         "no close frame received or sent",
         "1006 abnormal closure",
         "received 1000 (OK) The operation was cancelled.",
