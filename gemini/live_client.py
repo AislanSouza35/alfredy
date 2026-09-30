@@ -323,6 +323,20 @@ TEMPO_SILENCIO_FINALIZAR_AUDIO = 0.9
 # do limiar depois que a voz já saiu.
 PRE_ROLO_SEGUNDOS = 0.4
 
+# O limiar fixo serve para uma sala quieta. Com alto-falante, ventilador
+# ou rua aberta, o mesmo número deixa passar barulho como se fosse voz.
+# Estas constantes deixam o ALF medir o silêncio da sala e subir o
+# limiar até FATOR_ACIMA_DO_RUIDO vezes o ruído medido.
+FATOR_ACIMA_DO_RUIDO = 2.5
+
+# Teto: numa sala muito barulhenta, subir sem limite acabaria exigindo
+# grito. Melhor errar mandando barulho do que ficar surdo.
+LIMIAR_MAXIMO = 0.15
+
+# Peso de cada bloco novo na média do ruído. Baixo para a média não
+# pular por causa de uma porta batendo.
+PESO_DO_RUIDO_NOVO = 0.05
+
 # Tempo mínimo para considerar que uma sessão reconectada ficou estável.
 TEMPO_SESSAO_ESTAVEL = 45.0
 
@@ -466,6 +480,9 @@ class GeminiLiveWorker(QThread):
         # Última vez que o microfone ouviu voz de verdade. É daqui que
         # sai a medida de quanto o ALF demora para responder.
         self.momento_ultima_voz = None
+        # Média do nível do microfone nos momentos de silêncio: é o
+        # ruído de fundo da sala, medido em vez de suposto.
+        self.ruido_ambiente = None
         # Vezes que a placa de som pediu áudio e não havia. É o picote,
         # e é diferente de a fala ter sido cortada por interrupção --
         # os dois soam parecido para quem ouve.
@@ -5868,6 +5885,39 @@ class GeminiLiveWorker(QThread):
 
         return tentativas_atual + 1
 
+    def limiar_de_voz(self):
+        """
+        O volume a partir do qual vale a pena mandar o áudio.
+
+        Fixo em 0,045 servia para sala quieta. Com alto-falante ligado,
+        ventilador ou rua aberta, esse valor deixa passar barulho -- e
+        barulho que sobe vira "o usuário falou", o que faz o servidor
+        cortar a fala do ALF.
+
+        Fica sempre acima do ruído medido, com teto: numa sala muito
+        barulhenta, subir sem limite acabaria exigindo grito.
+        """
+
+        if self.ruido_ambiente is None:
+            return LIMIAR_VOZ_MICROFONE
+
+        return min(
+            LIMIAR_MAXIMO,
+            max(LIMIAR_VOZ_MICROFONE, self.ruido_ambiente * FATOR_ACIMA_DO_RUIDO),
+        )
+
+    def medir_ruido(self, nivel):
+        """Média corrida do silêncio da sala."""
+
+        if self.ruido_ambiente is None:
+            self.ruido_ambiente = nivel
+            return
+
+        self.ruido_ambiente = (
+            self.ruido_ambiente * (1 - PESO_DO_RUIDO_NOVO)
+            + nivel * PESO_DO_RUIDO_NOVO
+        )
+
     def decidir_envio_do_microfone(self, nivel, agora=None):
         """
         Diz o que fazer com o bloco: "enviar", "guardar" ou "encerrar".
@@ -5889,12 +5939,15 @@ class GeminiLiveWorker(QThread):
         if agora is None:
             agora = time.monotonic()
 
-        if nivel >= LIMIAR_VOZ_MICROFONE:
+        if nivel >= self.limiar_de_voz():
             self.momento_ultima_voz = agora
             self.usuario_falando_detectado = True
             return "enviar"
 
         if not self.usuario_falando_detectado:
+            # Só o silêncio antes da fala serve de amostra do ruído da
+            # sala. O silêncio no meio de uma frase é pausa, não sala.
+            self.medir_ruido(nivel)
             return "guardar"
 
         quieto_desde = self.momento_ultima_voz or agora

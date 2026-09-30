@@ -81,3 +81,76 @@ def test_o_comeco_da_palavra_vai_junto():
     assert "pre_rolo = deque(" in codigo
     assert "blocos = list(pre_rolo) + [audio_bytes]" in codigo
     assert live_client.PRE_ROLO_SEGUNDOS >= 0.3
+
+
+# ============================================================
+# O limiar acompanha o barulho da sala
+# ============================================================
+#
+# O usuário usa alto-falante. Um limiar fixo de 0,045 serve para sala
+# quieta; com o alto-falante ligado, ventilador ou rua aberta, ele
+# deixa passar barulho -- e barulho que sobe vira "o usuário falou",
+# que é o que faz o servidor cortar a fala do ALF.
+
+
+def test_sem_medida_usa_o_limiar_de_fabrica():
+    assert GeminiLiveWorker().limiar_de_voz() == live_client.LIMIAR_VOZ_MICROFONE
+
+
+def test_sala_barulhenta_sobe_o_limiar():
+    worker = GeminiLiveWorker()
+    worker.ruido_ambiente = 0.04
+
+    assert worker.limiar_de_voz() > live_client.LIMIAR_VOZ_MICROFONE
+    assert worker.limiar_de_voz() == 0.04 * live_client.FATOR_ACIMA_DO_RUIDO
+
+
+def test_sala_quieta_nao_abaixa_o_limiar():
+    """Abaixar deixaria qualquer respiração virar fala."""
+    worker = GeminiLiveWorker()
+    worker.ruido_ambiente = 0.001
+
+    assert worker.limiar_de_voz() == live_client.LIMIAR_VOZ_MICROFONE
+
+
+def test_o_limiar_tem_teto():
+    """Sem teto, sala muito barulhenta acabaria exigindo grito."""
+    worker = GeminiLiveWorker()
+    worker.ruido_ambiente = 0.9
+
+    assert worker.limiar_de_voz() == live_client.LIMIAR_MAXIMO
+
+
+def test_a_medida_do_ruido_nao_pula_com_uma_porta_batendo():
+    worker = GeminiLiveWorker()
+    for _ in range(50):
+        worker.medir_ruido(0.01)
+    calmo = worker.ruido_ambiente
+
+    worker.medir_ruido(0.9)
+
+    assert worker.ruido_ambiente < calmo + 0.1
+
+
+def test_so_o_silencio_antes_da_fala_vira_amostra():
+    """Pausa no meio de uma frase é pausa, não sala."""
+    worker = GeminiLiveWorker()
+
+    worker.decidir_envio_do_microfone(ALTO, agora=100.0)
+    worker.decidir_envio_do_microfone(0.001, agora=100.2)
+
+    assert worker.ruido_ambiente is None
+
+
+def test_barulho_forte_e_constante_deixa_de_passar_por_voz():
+    """O caso do alto-falante: o barulho da sala sobe junto."""
+    worker = GeminiLiveWorker()
+    barulho = 0.05
+
+    assert worker.decidir_envio_do_microfone(barulho, agora=100.0) == "enviar"
+
+    outro = GeminiLiveWorker()
+    for _ in range(200):
+        outro.medir_ruido(barulho)
+
+    assert outro.decidir_envio_do_microfone(barulho, agora=100.0) == "guardar"
