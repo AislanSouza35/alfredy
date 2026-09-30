@@ -3373,14 +3373,11 @@ class GeminiLiveWorker(QThread):
                 # Sem isto, o ALF reabria em poucos segundos, era recusado
                 # de novo, e o professor só via a chamada muda.
                 if self.parece_cota_esgotada(erro):
-                    decisao, detalhe = self.decidir_apos_cota(duracao_sessao)
-
-                    self.registrar_diagnostico(
-                        f"Cota esgotada ({self.quedas_por_cota}a vez). "
-                        f"Decisao: {decisao}."
-                    )
-
-                    if decisao == "parar" and self.pode_trocar_para_alternativa():
+                    # Havendo alternativa, troca já na primeira recusa.
+                    # Esperar dois minutos em silêncio por uma cota que
+                    # acabou, com outro provedor pronto ao lado, é tempo
+                    # de aula jogado fora.
+                    if self.pode_trocar_para_alternativa():
                         self.usando_alternativa = True
                         self.quedas_por_cota = 0
 
@@ -3398,6 +3395,15 @@ class GeminiLiveWorker(QThread):
                         self.solicitou_reconexao.emit()
                         await asyncio.sleep(1.0)
                         continue
+
+                    # Sem alternativa, o tempo é o único remédio: limite
+                    # por minuto passa sozinho, limite diário não.
+                    decisao, detalhe = self.decidir_apos_cota(duracao_sessao)
+
+                    self.registrar_diagnostico(
+                        f"Cota esgotada ({self.quedas_por_cota}a vez). "
+                        f"Decisao: {decisao}."
+                    )
 
                     if decisao == "parar":
                         self.erro_recebido.emit(detalhe)

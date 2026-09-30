@@ -46,15 +46,27 @@ def test_a_chamada_comeca_sempre_pelo_gemini():
     assert GeminiLiveWorker().usando_alternativa is False
 
 
-def test_a_troca_acontece_antes_de_encerrar():
+def test_a_troca_acontece_na_primeira_recusa():
     """
-    A ordem importa: se a checagem viesse depois do raise, a alternativa
-    nunca seria usada.
+    Esperar dois minutos em silêncio por uma cota que acabou, com outro
+    provedor pronto ao lado, é tempo de aula jogado fora. A checagem da
+    alternativa vem ANTES da decisão de esperar.
     """
-    trecho = CODIGO.split('if decisao == "parar"', 1)[1][:400]
+    trecho = CODIGO.split("if self.parece_cota_esgotada(erro):", 1)[1][:2500]
 
-    assert "pode_trocar_para_alternativa()" in trecho
+    posicao_troca = trecho.index("pode_trocar_para_alternativa()")
+    posicao_espera = trecho.index("decidir_apos_cota(duracao_sessao)")
+
+    assert posicao_troca < posicao_espera
     assert "usando_alternativa = True" in trecho
+
+
+def test_sem_alternativa_continua_esperando_antes_de_encerrar():
+    """Sem para onde ir, o tempo é o único remédio."""
+    trecho = CODIGO.split("if self.parece_cota_esgotada(erro):", 1)[1][:2500]
+
+    assert 'if decisao == "parar":' in trecho
+    assert "raise RuntimeError(detalhe)" in trecho
 
 
 def test_o_usuario_e_avisado_do_que_deixa_de_funcionar():
